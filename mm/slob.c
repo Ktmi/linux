@@ -58,6 +58,7 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/syscalls.h>
 #include <linux/slab.h>
 
 #include <linux/mm.h>
@@ -748,7 +749,7 @@ void __init kmem_cache_init_late(void)
 	slab_state = FULL;
 }
 
-asmlinkage long sys_get_slob_amt_claimed(void)
+SYSCALL_DEFINE0(get_slob_amt_claimed)
 {
 	long sum = 0;
 	int iterator = 0;
@@ -758,7 +759,7 @@ asmlinkage long sys_get_slob_amt_claimed(void)
 	return sum / HISTORY_LENGTH;
 }
 
-asmlinkage long sys_get_slob_amt_free(void)
+SYSCALL_DEFINE0(get_slob_amt_free)
 {
 	long sum = 0;
 	int iterator = 0;

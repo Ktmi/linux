@@ -103,6 +103,15 @@ static LIST_HEAD(free_slob_medium);
 static LIST_HEAD(free_slob_large);
 
 /*
+ * Statistics variables
+ */
+#define HISTORY_LENGTH 100
+long amt_claimed[HISTORY_LENGTH];
+long amt_free[HISTORY_LENGTH];
+int history_iterator;
+
+
+/*
  * slob_page_free: true for pages on free_slob_pages list.
  */
 static inline int slob_page_free(struct page *sp)
@@ -307,6 +316,9 @@ static void *slob_alloc(size_t size, gfp_t gfp, int align, int node,
 	unsigned long flags;
 	bool _unused;
 
+	/* Variable to keep track of free memory that we couldn't use*/
+	long temp_amt_free = 0;
+
 	if (size < SLOB_BREAK1)
 		slob_list = &free_slob_small;
 	else if (size < SLOB_BREAK2)
@@ -331,9 +343,18 @@ static void *slob_alloc(size_t size, gfp_t gfp, int align, int node,
 			continue;
 
 		b = slob_page_alloc(sp, size, align, align_offset, &page_removed_from_list);
-		if (!b)
-			continue;
 
+		/*
+		 * Every time the system fails to make an allocation, despite
+		 * there being enough units for an allocation, but the memory
+		 * is to fragmented to make that allocation, we record
+		 * the amount of free space we where denied.
+		 */
+		if (!b) {
+			if (slob_list == &free_slob_small)
+				temp_amt_free += sp->units;
+			continue;
+		}
 		/*
 		 * If slob_page_alloc() removed sp from the list then we
 		 * cannot call list functions on sp.  If so allocation
@@ -373,6 +394,16 @@ static void *slob_alloc(size_t size, gfp_t gfp, int align, int node,
 	}
 	if (unlikely(gfp & __GFP_ZERO))
 		memset(b, 0, size);
+
+	/* Record results */
+	if (slob_list == &free_slob_small)
+	{
+		spin_lock_irqsave(&slob_lock, flags);
+		amt_claimed[history_iterator] = size;
+		amt_free[history_iterator] = temp_amt_free * SLOB_UNIT;
+		history_iterator = (history_iterator + 1) % HISTORY_LENGTH;
+		spin_unlock_irqrestore(&slob_lock, flags);
+	}
 	return b;
 }
 
@@ -715,4 +746,24 @@ void __init kmem_cache_init(void)
 void __init kmem_cache_init_late(void)
 {
 	slab_state = FULL;
+}
+
+asmlinkage long sys_get_slob_amt_claimed(void)
+{
+	long sum = 0;
+	int iterator = 0;
+	for(iterator = 0; iterator < HISTORY_LENGTH; iterator++) {
+		sum += amt_claimed[iterator];
+	}
+	return sum / HISTORY_LENGTH;
+}
+
+asmlinkage long sys_get_slob_amt_free(void)
+{
+	long sum = 0;
+	int iterator = 0;
+	for(iterator = 0; iterator < HISTORY_LENGTH; iterator++) {
+		sum += amt_free[iterator];
+	}
+	return sum / HISTORY_LENGTH;
 }

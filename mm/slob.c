@@ -249,6 +249,9 @@ static void *slob_page_alloc(struct page *sp, size_t size, int align,
 {
 	slob_t *prev, *cur, *aligned = NULL;
 	int delta = 0, units = SLOB_UNITS(size);
+	
+	slob_t *best_fit_pos = NULL;
+	slob_t *best_fit_pos_prev = NULL;
 
 	*page_removed_from_list = false;
 	for (prev = NULL, cur = sp->freelist; ; prev = cur, cur = slob_next(cur)) {
@@ -267,42 +270,66 @@ static void *slob_page_alloc(struct page *sp, size_t size, int align,
 				 - align_offset);
 			delta = aligned - cur;
 		}
-		if (avail >= units + delta) { /* room enough? */
-			slob_t *next;
-
-			if (delta) { /* need to fragment head to align? */
-				next = slob_next(cur);
-				set_slob(aligned, avail - delta, next);
-				set_slob(cur, delta, aligned);
-				prev = cur;
-				cur = aligned;
-				avail = slob_units(cur);
+		
+		if (avail >= units + delta) {
+			if (best_fit_pos) {
+				if (avail <= slob_units(best_fit_pos)) {
+					best_fit_pos = cur;
+					best_fit_pos_prev = prev;
+				}
 			}
-
-			next = slob_next(cur);
-			if (avail == units) { /* exact fit? unlink. */
-				if (prev)
-					set_slob(prev, slob_units(prev), next);
-				else
-					sp->freelist = next;
-			} else { /* fragment */
-				if (prev)
-					set_slob(prev, slob_units(prev), cur + units);
-				else
-					sp->freelist = cur + units;
-				set_slob(cur + units, avail - units, next);
+			else {
+				best_fit_pos = cur;
+				best_fit_pos_prev = prev;
 			}
-
-			sp->units -= units;
-			if (!sp->units) {
-				clear_slob_page_free(sp);
-				*page_removed_from_list = true;
-			}
-			return cur;
 		}
 		if (slob_last(cur))
-			return NULL;
+			break;
 	}
+	
+	cur = best_fit_pos;
+	prev = best_fit_pos_prev;
+	slobidx_t avail = slob_units(cur);
+	if (align) {
+		aligned = (slob_t *)
+			(ALIGN((unsigned long)cur + align_offset, align)
+			 - align_offset);
+		delta = aligned - cur;
+	}
+	if (avail >= units + delta) { /* room enough? */
+		slob_t *next;
+
+		if (delta) { /* need to fragment head to align? */
+			next = slob_next(cur);
+			set_slob(aligned, avail - delta, next);
+			set_slob(cur, delta, aligned);
+			prev = cur;
+			cur = aligned;
+			avail = slob_units(cur);
+		}
+
+		next = slob_next(cur);
+		if (avail == units) { /* exact fit? unlink. */
+			if (prev)
+				set_slob(prev, slob_units(prev), next);
+			else
+				sp->freelist = next;
+		} else { /* fragment */
+			if (prev)
+				set_slob(prev, slob_units(prev), cur + units);
+			else
+				sp->freelist = cur + units;
+			set_slob(cur + units, avail - units, next);
+		}
+
+		sp->units -= units;
+		if (!sp->units) {
+			clear_slob_page_free(sp);
+			*page_removed_from_list = true;
+		}
+		return cur;
+	}
+	return NULL;
 }
 
 /*

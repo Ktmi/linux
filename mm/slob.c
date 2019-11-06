@@ -109,7 +109,7 @@ static LIST_HEAD(free_slob_large);
 #define HISTORY_LENGTH 100
 long amt_claimed[HISTORY_LENGTH];
 long amt_free[HISTORY_LENGTH];
-int history_iterator;
+int history_iterator = 0;
 
 
 /*

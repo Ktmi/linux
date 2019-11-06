@@ -301,48 +301,50 @@ static void *slob_page_alloc(struct page *sp, size_t size, int align,
 		if (slob_last(cur))
 			break;
 	}
-	
-	cur = best_fit_pos;
-	prev = best_fit_pos_prev;
-	slobidx_t avail = slob_units(cur);
-	if (align) {
-		aligned = (slob_t *)
-			(ALIGN((unsigned long)cur + align_offset, align)
-			 - align_offset);
-		delta = aligned - cur;
-	}
-	if (avail >= units + delta) { /* room enough? */
-		slob_t *next;
+	if(best_fit_pos)
+	{
+		cur = best_fit_pos;
+		prev = best_fit_pos_prev;
+		slobidx_t avail = slob_units(cur);
+		if (align) {
+			aligned = (slob_t *)
+				(ALIGN((unsigned long)cur + align_offset, align)
+				 - align_offset);
+			delta = aligned - cur;
+		}
+		if (avail >= units + delta) { /* room enough? */
+			slob_t *next;
 
-		if (delta) { /* need to fragment head to align? */
+			if (delta) { /* need to fragment head to align? */
+				next = slob_next(cur);
+				set_slob(aligned, avail - delta, next);
+				set_slob(cur, delta, aligned);
+				prev = cur;
+				cur = aligned;
+				avail = slob_units(cur);
+			}
+
 			next = slob_next(cur);
-			set_slob(aligned, avail - delta, next);
-			set_slob(cur, delta, aligned);
-			prev = cur;
-			cur = aligned;
-			avail = slob_units(cur);
-		}
+			if (avail == units) { /* exact fit? unlink. */
+				if (prev)
+					set_slob(prev, slob_units(prev), next);
+				else
+					sp->freelist = next;
+			} else { /* fragment */
+				if (prev)
+					set_slob(prev, slob_units(prev), cur + units);
+				else
+					sp->freelist = cur + units;
+				set_slob(cur + units, avail - units, next);
+			}
 
-		next = slob_next(cur);
-		if (avail == units) { /* exact fit? unlink. */
-			if (prev)
-				set_slob(prev, slob_units(prev), next);
-			else
-				sp->freelist = next;
-		} else { /* fragment */
-			if (prev)
-				set_slob(prev, slob_units(prev), cur + units);
-			else
-				sp->freelist = cur + units;
-			set_slob(cur + units, avail - units, next);
+			sp->units -= units;
+			if (!sp->units) {
+				clear_slob_page_free(sp);
+				*page_removed_from_list = true;
+			}
+			return cur;
 		}
-
-		sp->units -= units;
-		if (!sp->units) {
-			clear_slob_page_free(sp);
-			*page_removed_from_list = true;
-		}
-		return cur;
 	}
 	return NULL;
 }

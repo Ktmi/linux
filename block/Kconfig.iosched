@@ -22,6 +22,14 @@ config IOSCHED_DEADLINE
 	  a new point in the service tree and doing a batch of IO from there
 	  in case of expiry.
 
+config IOSCHED_CLOOK
+	tristate "CLOOK I/O scheduler"
+	default y
+	---help---
+	  The c-look I/O scheduler is modified from the no-op I/O scheduler.
+	  It will sort requests as they are added  to the queue, relative to the
+	  current head position.
+
 config IOSCHED_CFQ
 	tristate "CFQ I/O scheduler"
 	default y
@@ -57,6 +65,9 @@ choice
 	config DEFAULT_NOOP
 		bool "No-op"
 
+	config DEFAULT_CLOOK
+		bool "CLOOK" if IOSCHED_CLOOK=y
+
 endchoice
 
 config DEFAULT_IOSCHED
@@ -64,6 +75,7 @@ config DEFAULT_IOSCHED
 	default "deadline" if DEFAULT_DEADLINE
 	default "cfq" if DEFAULT_CFQ
 	default "noop" if DEFAULT_NOOP
+	default "clook" if DEFAULT_CLOOK
 
 config MQ_IOSCHED_DEADLINE
 	tristate "MQ deadline I/O scheduler"

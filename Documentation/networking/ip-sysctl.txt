@@ -10,6 +10,12 @@ ip_forward - BOOLEAN
 	parameters to their default state (RFC1122 for hosts, RFC1812
 	for routers)
 
+ip_ignore_csum - BOOLEAN
+	0 - disabled (default)
+	not 0 - enabled
+
+	Ignore checking the header checksum of incoming IP packets.
+
 ip_default_ttl - INTEGER
 	Default value of TTL field (Time To Live) for outgoing (but not
 	forwarded) IP packets. Should be between 1 and 255 inclusive.

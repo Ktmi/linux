@@ -372,6 +372,9 @@ drop:
 	return NET_RX_DROP;
 }
 
+int sysctl_ip_ignore_csum __read_mostly = 0;
+EXPORT_SYMBOL(sysctl_ip_ignore_csum);
+
 /*
  * 	Main IP Receive routine.
  */
@@ -418,8 +421,8 @@ int ip_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt, 
 
 	iph = ip_hdr(skb);
 
-	if (unlikely(ip_fast_csum((u8 *)iph, iph->ihl)))
-		goto csum_error;
+	if (!sysctl_ip_ignore_csum && unlikely(ip_fast_csum((u8 *)iph, iph->ihl)) )
+	 	goto csum_error;
 
 	len = ntohs(iph->tot_len);
 	if (skb->len < len) {

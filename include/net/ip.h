@@ -217,6 +217,7 @@ extern int inet_peer_maxttl;
 
 /* From ip_input.c */
 extern int sysctl_ip_early_demux;
+extern int sysctl_ip_ignore_csum;
 
 /* From ip_output.c */
 extern int sysctl_ip_dynaddr;

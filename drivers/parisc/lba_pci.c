@@ -111,8 +111,10 @@ static u32 lba_t32;
 
 
 /* Looks nice and keeps the compiler happy */
-#define LBA_DEV(d) ((struct lba_device *) (d))
-
+#define LBA_DEV(d) ({				\
+	void *__pdata = d;			\
+	BUG_ON(!__pdata);			\
+	(struct lba_device *)__pdata; })
 
 /*
 ** Only allow 8 subsidiary busses per LBA
@@ -613,9 +615,93 @@ truncate_pat_collision(struct resource *root, struct resource *new)
 	return 0;	/* truncation successful */
 }
 
+/*
+ * extend_lmmio_len: extend lmmio range to maximum length
+ *
+ * This is needed at least on C8000 systems to get the ATI FireGL card
+ * working. On other systems we will currently not extend the lmmio space.
+ */
+static unsigned long
+extend_lmmio_len(unsigned long start, unsigned long end, unsigned long lba_len)
+{
+	struct resource *tmp;
+
+	/* exit if not a C8000 */
+	if (boot_cpu_data.cpu_type < mako)
+		return end;
+
+	pr_debug("LMMIO mismatch: PAT length = 0x%lx, MASK register = 0x%lx\n",
+		end - start, lba_len);
+
+	lba_len = min(lba_len+1, 256UL*1024*1024); /* limit to 256 MB */
+
+	pr_debug("LBA: lmmio_space [0x%lx-0x%lx] - original\n", start, end);
+
+
+	end += lba_len;
+	if (end < start) /* fix overflow */
+		end = -1ULL;
+
+	pr_debug("LBA: lmmio_space [0x%lx-0x%lx] - current\n", start, end);
+
+	/* first overlap */
+	for (tmp = iomem_resource.child; tmp; tmp = tmp->sibling) {
+		pr_debug("LBA: testing %pR\n", tmp);
+		if (tmp->start == start)
+			continue; /* ignore ourself */
+		if (tmp->end < start)
+			continue;
+		if (tmp->start > end)
+			continue;
+		if (end >= tmp->start)
+			end = tmp->start - 1;
+	}
+
+	pr_info("LBA: lmmio_space [0x%lx-0x%lx] - new\n", start, end);
+
+	/* return new end */
+	return end;
+}
+
 #else
 #define truncate_pat_collision(r,n)  (0)
 #endif
+
+static void pcibios_allocate_bridge_resources(struct pci_dev *dev)
+{
+	int idx;
+	struct resource *r;
+
+	for (idx = PCI_BRIDGE_RESOURCES; idx < PCI_NUM_RESOURCES; idx++) {
+		r = &dev->resource[idx];
+		if (!r->flags)
+			continue;
+		if (r->parent)	/* Already allocated */
+			continue;
+		if (!r->start || pci_claim_bridge_resource(dev, idx) < 0) {
+			/*
+			 * Something is wrong with the region.
+			 * Invalidate the resource to prevent
+			 * child resource allocations in this
+			 * range.
+			 */
+			r->start = r->end = 0;
+			r->flags = 0;
+		}
+	}
+}
+
+static void pcibios_allocate_bus_resources(struct pci_bus *bus)
+{
+	struct pci_bus *child;
+
+	/* Depth-First Search on bus tree */
+	if (bus->self)
+		pcibios_allocate_bridge_resources(bus->self);
+	list_for_each_entry(child, &bus->children, node)
+		pcibios_allocate_bus_resources(child);
+}
+
 
 /*
 ** The algorithm is generic code.
@@ -643,12 +729,11 @@ lba_fixup_bus(struct pci_bus *bus)
 	** pci_alloc_primary_bus() mangles this.
 	*/
 	if (bus->parent) {
-		int i;
 		/* PCI-PCI Bridge */
 		pci_read_bridge_bases(bus);
-		for (i = PCI_BRIDGE_RESOURCES; i < PCI_NUM_RESOURCES; i++) {
-			pci_claim_resource(bus->self, i);
-		}
+
+		/* check and allocate bridge resources */
+		pcibios_allocate_bus_resources(bus);
 	} else {
 		/* Host-PCI Bridge */
 		int err;
@@ -743,8 +828,10 @@ lba_fixup_bus(struct pci_bus *bus)
                 /*
 		** P2PB's have no IRQs. ignore them.
 		*/
-		if ((dev->class >> 8) == PCI_CLASS_BRIDGE_PCI)
+		if ((dev->class >> 8) == PCI_CLASS_BRIDGE_PCI) {
+			pcibios_init_bridge(dev);
 			continue;
+		}
 
 		/* Adjust INTERRUPT_LINE for this dev */
 		iosapic_fixup_irq(ldev->iosapic_obj, dev);
@@ -994,6 +1081,14 @@ lba_pat_resources(struct parisc_device *pa_dev, struct lba_device *lba_dev)
 		case PAT_LMMIO:
 			/* used to fix up pre-initialized MEM BARs */
 			if (!lba_dev->hba.lmmio_space.flags) {
+				unsigned long lba_len;
+
+				lba_len = ~READ_REG32(lba_dev->hba.base_addr
+						+ LBA_LMMIO_MASK);
+				if ((p->end - p->start) != lba_len)
+					p->end = extend_lmmio_len(p->start,
+						p->end, lba_len);
+
 				sprintf(lba_dev->hba.lmmio_name,
 						"PCI%02x LMMIO",
 						(int)lba_dev->hba.bus_num.start);
@@ -1501,8 +1596,11 @@ lba_driver_probe(struct parisc_device *dev)
 	if (lba_dev->hba.lmmio_space.flags)
 		pci_add_resource_offset(&resources, &lba_dev->hba.lmmio_space,
 					lba_dev->hba.lmmio_space_offset);
-	if (lba_dev->hba.gmmio_space.flags)
-		pci_add_resource(&resources, &lba_dev->hba.gmmio_space);
+	if (lba_dev->hba.gmmio_space.flags) {
+		/* Not registering GMMIO space - according to docs it's not
+		 * even used on HP-UX. */
+		/* pci_add_resource(&resources, &lba_dev->hba.gmmio_space); */
+	}
 
 	pci_add_resource(&resources, &lba_dev->hba.bus_num);
 
@@ -1534,7 +1632,6 @@ lba_driver_probe(struct parisc_device *dev)
 		lba_dump_res(&lba_dev->hba.lmmio_space, 2);
 #endif
 	}
-	pci_enable_bridges(lba_bus);
 
 	/*
 	** Once PCI register ops has walked the bus, access to config
@@ -1552,14 +1649,14 @@ lba_driver_probe(struct parisc_device *dev)
 	return 0;
 }
 
-static struct parisc_device_id lba_tbl[] = {
+static const struct parisc_device_id lba_tbl[] __initconst = {
 	{ HPHW_BRIDGE, HVERSION_REV_ANY_ID, ELROY_HVERS, 0xa },
 	{ HPHW_BRIDGE, HVERSION_REV_ANY_ID, MERCURY_HVERS, 0xa },
 	{ HPHW_BRIDGE, HVERSION_REV_ANY_ID, QUICKSILVER_HVERS, 0xa },
 	{ 0, }
 };
 
-static struct parisc_driver lba_driver = {
+static struct parisc_driver lba_driver __refdata = {
 	.name =		MODULE_NAME,
 	.id_table =	lba_tbl,
 	.probe =	lba_driver_probe,

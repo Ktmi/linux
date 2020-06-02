@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
 /* const.h: Macros for dealing with constants.  */
 
 #ifndef _LINUX_CONST_H
@@ -20,5 +21,8 @@
 #define _AC(X,Y)	__AC(X,Y)
 #define _AT(T,X)	((T)(X))
 #endif
+
+#define _BITUL(x)	(_AC(1,UL) << (x))
+#define _BITULL(x)	(_AC(1,ULL) << (x))
 
 #endif /* !(_LINUX_CONST_H) */

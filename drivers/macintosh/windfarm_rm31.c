@@ -338,7 +338,7 @@ static int cpu_setup_pid(int cpu)
 }
 
 /* Backside/U3 fan */
-static struct wf_pid_param backside_param = {
+static const struct wf_pid_param backside_param = {
 	.interval	= 1,
 	.history_len	= 2,
 	.gd		= 0x00500000,
@@ -351,7 +351,7 @@ static struct wf_pid_param backside_param = {
 };
 
 /* DIMMs temperature (clamp the backside fan) */
-static struct wf_pid_param dimms_param = {
+static const struct wf_pid_param dimms_param = {
 	.interval	= 1,
 	.history_len	= 20,
 	.gd		= 0,
@@ -439,15 +439,15 @@ static void backside_setup_pid(void)
 
 /* Slots fan */
 static const struct wf_pid_param slots_param = {
-	.interval	= 5,
-	.history_len	= 2,
-	.gd		= 30 << 20,
-	.gp		= 5 << 20,
-	.gr		= 0,
-	.itarget	= 40 << 16,
-	.additive	= 1,
-	.min		= 300,
-	.max		= 4000,
+	.interval	= 1,
+	.history_len	= 20,
+	.gd		= 0,
+	.gp		= 0,
+	.gr		= 0x00100000,
+	.itarget	= 3200000,
+	.additive	= 0,
+	.min		= 20,
+	.max		= 100,
 };
 
 static void slots_fan_tick(void)
@@ -682,7 +682,6 @@ static struct platform_driver wf_rm31_driver = {
 	.remove	= wf_rm31_remove,
 	.driver	= {
 		.name = "windfarm",
-		.owner	= THIS_MODULE,
 	},
 };
 

@@ -98,4 +98,10 @@ config BPF_LSM
 
 	  If you are unsure how to answer this question, answer N.
 
+config BPF_IO
+	bool "Enable BPF for file IO"
+	depends on BPF_SYSCALL
+	help
+	  Enables using BPF to drive file IO 
+
 endmenu # "BPF subsystem"

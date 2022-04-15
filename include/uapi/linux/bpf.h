@@ -952,6 +952,7 @@ enum bpf_prog_type {
 	BPF_PROG_TYPE_LSM,
 	BPF_PROG_TYPE_SK_LOOKUP,
 	BPF_PROG_TYPE_SYSCALL, /* a program that can execute syscalls */
+	BPF_PROG_TYPE_IO,
 };
 
 enum bpf_attach_type {
@@ -5339,6 +5340,9 @@ union bpf_attr {
 	FN(copy_from_user_task),	\
 	FN(skb_set_tstamp),		\
 	FN(ima_file_hash),		\
+	FN(io_read),		\
+	FN(io_write),		\
+	FN(io_seek),		\
 	/* */
 
 /* integer value in 'imm' field of BPF_CALL instruction selects which helper
@@ -5744,6 +5748,12 @@ struct xdp_md {
 	__u32 rx_queue_index;  /* rxq->queue_index  */
 
 	__u32 egress_ifindex;  /* txq->dev->ifindex */
+};
+
+struct bpf_io_md {
+    __u32 buf;
+    __u32 buf_end;
+	__s32 fd;
 };
 
 /* DEVMAP map-value layout

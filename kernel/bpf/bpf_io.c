@@ -91,11 +91,11 @@ io_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 {
 	switch (func_id) {
 	case BPF_FUNC_io_read:
-		return &bpf_io_read_proto;
+		return prog->aux->sleepable ? &bpf_io_read_proto : NULL;
 	case BPF_FUNC_io_write:
-		return &bpf_io_write_proto;
+		return prog->aux->sleepable ? &bpf_io_write_proto : NULL;
 	case BPF_FUNC_io_seek:
-		return &bpf_io_seek_proto;
+		return prog->aux->sleepable ? &bpf_io_seek_proto : NULL;
 	default:
 		return bpf_base_func_proto(func_id);
 	}

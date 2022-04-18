@@ -14311,6 +14311,13 @@ static int check_attach_btf_id(struct bpf_verifier_env *env)
 		verbose(env, "Syscall programs can only be sleepable\n");
 		return -EINVAL;
 	}
+	if (prog->type == BPF_PROG_TYPE_IO) {
+		if (prog->aux->sleepable)
+			/* attach_btf_id checked to be zero already */
+			return 0;
+		verbose(env, "IO programs can only be sleepable\n");
+		return -EINVAL;
+	}
 
 	if (prog->aux->sleepable && prog->type != BPF_PROG_TYPE_TRACING &&
 	    prog->type != BPF_PROG_TYPE_LSM) {

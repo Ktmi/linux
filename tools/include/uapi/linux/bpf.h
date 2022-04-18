@@ -5144,6 +5144,27 @@ union bpf_attr {
  *		The **hash_algo** is returned on success,
  *		**-EOPNOTSUP** if the hash calculation failed or **-EINVAL** if
  *		invalid arguments are passed.
+ *
+ * s64 bpf_io_read(struct bpf_io_buff *io_md, u32 count)
+ *	Description
+ *		Read *count* bytes from the file linked to *io_md* into the *io_md* buffer.
+ *	Return
+ *		Total bytes read from the file is returned on success,
+ *		**-EINVAL** for invalid input.
+ *
+ * s64 bpf_io_write(struct bpf_io_buff *io_md, u32 count)
+ *	Description
+ *		Write *count* bytes from the *io_md* buffer into the file linked to *io_md*.
+ *	Return
+ *		Total bytes written to the file is returned on success,
+ *		**-EINVAL** for invalid input.
+ *
+ * s64 bpf_io_seek(struct bpf_io_buff *io_md, s64 offset, u32 whence)
+ *	Description
+ *		Seek to *offset* bytes from *whence* in file linked to *io_md*.
+ *	Return
+ *		New file offset is returned on success,
+ *		**-EINVAL** for invalid input.
  */
 #define __BPF_FUNC_MAPPER(FN)		\
 	FN(unspec),			\

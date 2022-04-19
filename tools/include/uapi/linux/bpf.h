@@ -937,6 +937,7 @@ enum bpf_prog_type {
 	BPF_PROG_TYPE_EXT,
 	BPF_PROG_TYPE_LSM,
 	BPF_PROG_TYPE_SK_LOOKUP,
+	BPF_PROG_TYPE_IO,
 };
 
 enum bpf_attach_type {
@@ -4735,6 +4736,27 @@ union bpf_attr {
  *		be zero-terminated except when **str_size** is 0.
  *
  *		Or **-EBUSY** if the per-CPU memory copy buffer is busy.
+ *
+ * s64 bpf_io_read(struct bpf_io_buff *io_md, u32 count)
+ *	Description
+ *		Read *count* bytes from the file linked to *io_md* into the *io_md* buffer.
+ *	Return
+ *		Total bytes read from the file is returned on success,
+ *		**-EINVAL** for invalid input.
+ *
+ * s64 bpf_io_write(struct bpf_io_buff *io_md, u32 count)
+ *	Description
+ *		Write *count* bytes from the *io_md* buffer into the file linked to *io_md*.
+ *	Return
+ *		Total bytes written to the file is returned on success,
+ *		**-EINVAL** for invalid input.
+ *
+ * s64 bpf_io_seek(struct bpf_io_buff *io_md, s64 offset, u32 whence)
+ *	Description
+ *		Seek to *offset* bytes from *whence* in file linked to *io_md*.
+ *	Return
+ *		New file offset is returned on success,
+ *		**-EINVAL** for invalid input.
  */
 #define __BPF_FUNC_MAPPER(FN)		\
 	FN(unspec),			\
@@ -4903,6 +4925,9 @@ union bpf_attr {
 	FN(check_mtu),			\
 	FN(for_each_map_elem),		\
 	FN(snprintf),			\
+	FN(io_read),			\
+	FN(io_write),			\
+	FN(io_seek),			\
 	/* */
 
 /* integer value in 'imm' field of BPF_CALL instruction selects which helper
@@ -5289,6 +5314,14 @@ struct xdp_md {
 	__u32 rx_queue_index;  /* rxq->queue_index  */
 
 	__u32 egress_ifindex;  /* txq->dev->ifindex */
+};
+
+/* User accessible metadata for bpf_io programs
+ */
+struct bpf_io_md {
+	__u32 buf;
+	__u32 buf_end;
+	__s32 fd;
 };
 
 /* DEVMAP map-value layout

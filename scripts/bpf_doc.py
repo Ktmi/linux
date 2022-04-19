@@ -547,6 +547,7 @@ class PrinterHelpers(Printer):
             'struct inode',
             'struct socket',
             'struct file',
+            'struct bpf_io_md',
     ]
     known_types = {
             '...',
@@ -610,6 +611,7 @@ class PrinterHelpers(Printer):
             'const struct sk_buff': 'const struct __sk_buff',
             'struct sk_msg_buff': 'struct sk_msg_md',
             'struct xdp_buff': 'struct xdp_md',
+            'struct bpf_io_buff' : 'struct bpf_io_md',
     }
     # Helpers overloaded for different context types.
     overloaded_helpers = [

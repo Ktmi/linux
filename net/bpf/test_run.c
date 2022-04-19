@@ -2,6 +2,7 @@
 /* Copyright (c) 2017 Facebook
  */
 #include <linux/bpf.h>
+#include <linux/bpf_io.h>
 #include <linux/btf_ids.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
@@ -916,5 +917,73 @@ int bpf_prog_test_run_sk_lookup(struct bpf_prog *prog, const union bpf_attr *kat
 out:
 	bpf_prog_array_free(progs);
 	kfree(user_ctx);
+	return ret;
+}
+
+int bpf_prog_test_run_io(struct bpf_prog *prog,
+			 const union bpf_attr *kattr,
+			 union bpf_attr __user *uattr)
+{
+	u32 tailroom = 0;
+	u32 size = kattr->test.data_size_in;
+	u32 headroom = 0;
+	u32 max_data_sz;
+	u32 retval, duration;
+	u32 repeat = kattr->test.repeat;
+	int ret = -EINVAL;
+	struct bpf_io_buff io = {};
+	struct bpf_io_md *ctx;
+	void *data;
+	struct fd f;
+
+	//Create context
+	ctx = bpf_ctx_init(kattr, sizeof(struct bpf_io_md));
+	if (IS_ERR(ctx))
+		return PTR_ERR(ctx);
+
+	// Check context requirements
+	if (!ctx)
+		goto end;
+	if (ctx->buf || ctx->buf_end != size)
+		goto free_ctx;
+
+	max_data_sz = PAGE_SIZE - headroom - tailroom; // Not currently using head/tail room
+	size = min_t(u32, size, max_data_sz);
+
+	// Create data buffer
+	data = bpf_test_init(kattr, max_data_sz, headroom, tailroom);
+	if (IS_ERR(data)) {
+		ret = PTR_ERR(data);
+		goto free_ctx;
+	}
+	// Initialize buff from input data
+	io.buf = data;
+	io.buf_end = data + size;
+
+	// Initialized buff from md
+	f = fdget_pos(ctx->fd);
+	if (!f.file) {
+		ret = -EBADF;
+		goto free_data;
+	}
+	io.filp = f.file;
+	io.fd = ctx->fd;
+
+	// Execute Test
+	ret = bpf_test_run(prog, &io, repeat, &retval, &duration, false);
+	if (ret)
+		goto free_file;
+
+	// Finalize test results
+	ret = bpf_test_finish(kattr, uattr, data, size, retval, duration);
+	if (!ret)
+		ret = bpf_ctx_finish(kattr, uattr, ctx, sizeof(struct bpf_io_md));
+free_file:
+	fdput_pos(f);
+free_data:
+	kfree(data);
+free_ctx:
+	kfree(ctx);
+end:
 	return ret;
 }

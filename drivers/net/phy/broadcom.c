@@ -288,7 +288,7 @@ static void bcm54xx_adjust_rxrefclk(struct phy_device *phydev)
 	if (phydev->dev_flags & PHY_BRCM_DIS_TXCRXC_NOENRGY) {
 		if (BRCM_PHY_MODEL(phydev) == PHY_ID_BCM54210E ||
 		    BRCM_PHY_MODEL(phydev) == PHY_ID_BCM54810 ||
-		    BRCM_PHY_MODEL(phydev) == PHY_ID_BCM54210E)
+		    BRCM_PHY_MODEL(phydev) == PHY_ID_BCM54811)
 			val |= BCM54XX_SHD_SCR3_RXCTXC_DIS;
 		else
 			val |= BCM54XX_SHD_SCR3_TRDDAPD;
@@ -768,6 +768,7 @@ static struct phy_driver broadcom_drivers[] = {
 	.phy_id_mask	= 0xfffffff0,
 	.name		= "Broadcom BCM54616S",
 	/* PHY_GBIT_FEATURES */
+	.soft_reset     = genphy_soft_reset,
 	.config_init	= bcm54xx_config_init,
 	.config_aneg	= bcm54616s_config_aneg,
 	.config_intr	= bcm_phy_config_intr,

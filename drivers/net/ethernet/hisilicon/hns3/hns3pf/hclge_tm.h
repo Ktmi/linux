@@ -228,8 +228,8 @@ int hclge_tm_dwrr_cfg(struct hclge_dev *hdev);
 int hclge_tm_init_hw(struct hclge_dev *hdev, bool init);
 int hclge_mac_pause_en_cfg(struct hclge_dev *hdev, bool tx, bool rx);
 int hclge_pause_addr_cfg(struct hclge_dev *hdev, const u8 *mac_addr);
-int hclge_pfc_rx_stats_get(struct hclge_dev *hdev, u64 *stats);
-int hclge_pfc_tx_stats_get(struct hclge_dev *hdev, u64 *stats);
+void hclge_pfc_rx_stats_get(struct hclge_dev *hdev, u64 *stats);
+void hclge_pfc_tx_stats_get(struct hclge_dev *hdev, u64 *stats);
 int hclge_tm_qs_shaper_cfg(struct hclge_vport *vport, int max_tx_rate);
 int hclge_tm_get_qset_num(struct hclge_dev *hdev, u16 *qset_num);
 int hclge_tm_get_pri_num(struct hclge_dev *hdev, u8 *pri_num);
@@ -242,4 +242,5 @@ int hclge_tm_get_pri_weight(struct hclge_dev *hdev, u8 pri_id, u8 *weight);
 int hclge_tm_get_pri_shaper(struct hclge_dev *hdev, u8 pri_id,
 			    enum hclge_opcode_type cmd,
 			    struct hclge_pri_shaper_para *para);
+int hclge_mac_pause_setup_hw(struct hclge_dev *hdev);
 #endif

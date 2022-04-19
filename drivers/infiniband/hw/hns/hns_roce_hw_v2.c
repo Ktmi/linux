@@ -33,6 +33,7 @@
 #include <linux/acpi.h>
 #include <linux/etherdevice.h>
 #include <linux/interrupt.h>
+#include <linux/iopoll.h>
 #include <linux/kernel.h>
 #include <linux/types.h>
 #include <net/addrconf.h>
@@ -274,8 +275,6 @@ static int set_rc_inl(struct hns_roce_qp *qp, const struct ib_send_wr *wr,
 
 	dseg += sizeof(struct hns_roce_v2_rc_send_wqe);
 
-	roce_set_bit(rc_sq_wqe->byte_4, V2_RC_SEND_WQE_BYTE_4_INLINE_S, 1);
-
 	if (msg_len <= HNS_ROCE_V2_MAX_RC_INL_INN_SZ) {
 		roce_set_bit(rc_sq_wqe->byte_20,
 			     V2_RC_SEND_WQE_BYTE_20_INL_TYPE_S, 0);
@@ -320,6 +319,8 @@ static int set_rwqe_data_seg(struct ib_qp *ibqp, const struct ib_send_wr *wr,
 		       V2_RC_SEND_WQE_BYTE_20_MSG_START_SGE_IDX_S,
 		       (*sge_ind) & (qp->sge.sge_cnt - 1));
 
+	roce_set_bit(rc_sq_wqe->byte_4, V2_RC_SEND_WQE_BYTE_4_INLINE_S,
+		     !!(wr->send_flags & IB_SEND_INLINE));
 	if (wr->send_flags & IB_SEND_INLINE)
 		return set_rc_inl(qp, wr, rc_sq_wqe, sge_ind);
 
@@ -791,8 +792,7 @@ out:
 		qp->sq.head += nreq;
 		qp->next_sge = sge_idx;
 
-		if (nreq == 1 && qp->sq.head == qp->sq.tail + 1 &&
-		    (qp->en_flags & HNS_ROCE_QP_CAP_DIRECT_WQE))
+		if (nreq == 1 && (qp->en_flags & HNS_ROCE_QP_CAP_DIRECT_WQE))
 			write_dwqe(hr_dev, qp, wqe);
 		else
 			update_sq_db(hr_dev, qp);
@@ -1084,9 +1084,14 @@ static u32 hns_roce_v2_cmd_hw_resetting(struct hns_roce_dev *hr_dev,
 					unsigned long instance_stage,
 					unsigned long reset_stage)
 {
+#define HW_RESET_TIMEOUT_US 1000000
+#define HW_RESET_SLEEP_US 1000
+
 	struct hns_roce_v2_priv *priv = hr_dev->priv;
 	struct hnae3_handle *handle = priv->handle;
 	const struct hnae3_ae_ops *ops = handle->ae_algo->ops;
+	unsigned long val;
+	int ret;
 
 	/* When hardware reset is detected, we should stop sending mailbox&cmq&
 	 * doorbell to hardware. If now in .init_instance() function, we should
@@ -1098,7 +1103,11 @@ static u32 hns_roce_v2_cmd_hw_resetting(struct hns_roce_dev *hr_dev,
 	 * again.
 	 */
 	hr_dev->dis_db = true;
-	if (!ops->get_hw_reset_stat(handle))
+
+	ret = read_poll_timeout(ops->ae_dev_reset_cnt, val,
+				val > hr_dev->reset_cnt, HW_RESET_SLEEP_US,
+				HW_RESET_TIMEOUT_US, false, handle);
+	if (!ret)
 		hr_dev->is_reset = true;
 
 	if (!hr_dev->is_reset || reset_stage == HNS_ROCE_STATE_RST_INIT ||
@@ -1620,6 +1629,22 @@ static void hns_roce_function_clear(struct hns_roce_dev *hr_dev)
 	}
 }
 
+static int hns_roce_clear_extdb_list_info(struct hns_roce_dev *hr_dev)
+{
+	struct hns_roce_cmq_desc desc;
+	int ret;
+
+	hns_roce_cmq_setup_basic_desc(&desc, HNS_ROCE_OPC_CLEAR_EXTDB_LIST_INFO,
+				      false);
+	ret = hns_roce_cmq_send(hr_dev, &desc, 1);
+	if (ret)
+		ibdev_err(&hr_dev->ib_dev,
+			  "failed to clear extended doorbell info, ret = %d.\n",
+			  ret);
+
+	return ret;
+}
+
 static int hns_roce_query_fw_ver(struct hns_roce_dev *hr_dev)
 {
 	struct hns_roce_query_fw_info *resp;
@@ -2092,12 +2117,6 @@ static void set_hem_page_size(struct hns_roce_dev *hr_dev)
 		   HEM_TYPE_CQC);
 	calc_pg_sz(caps->max_cqes, caps->cqe_sz, caps->cqe_hop_num,
 		   1, &caps->cqe_buf_pg_sz, &caps->cqe_ba_pg_sz, HEM_TYPE_CQE);
-
-	if (caps->cqc_timer_entry_sz)
-		calc_pg_sz(caps->num_cqc_timer, caps->cqc_timer_entry_sz,
-			   caps->cqc_timer_hop_num, caps->cqc_timer_bt_num,
-			   &caps->cqc_timer_buf_pg_sz,
-			   &caps->cqc_timer_ba_pg_sz, HEM_TYPE_CQC_TIMER);
 
 	/* SRQ */
 	if (caps->flags & HNS_ROCE_CAP_FLAG_SRQ) {
@@ -2739,6 +2758,11 @@ static int hns_roce_v2_init(struct hns_roce_dev *hr_dev)
 	struct hns_roce_v2_priv *priv = hr_dev->priv;
 	int ret;
 
+	/* The hns ROCEE requires the extdb info to be cleared before using */
+	ret = hns_roce_clear_extdb_list_info(hr_dev);
+	if (ret)
+		return ret;
+
 	ret = get_hem_table(hr_dev);
 	if (ret)
 		return ret;
@@ -3324,7 +3348,7 @@ static void __hns_roce_v2_cq_clean(struct hns_roce_cq *hr_cq, u32 qpn,
 					  hr_cq->ib_cq.cqe);
 			owner_bit = roce_get_bit(dest->byte_4,
 						 V2_CQE_BYTE_4_OWNER_S);
-			memcpy(dest, cqe, sizeof(*cqe));
+			memcpy(dest, cqe, hr_cq->cqe_size);
 			roce_set_bit(dest->byte_4, V2_CQE_BYTE_4_OWNER_S,
 				     owner_bit);
 		}
@@ -4485,12 +4509,13 @@ static int modify_qp_init_to_rtr(struct ib_qp *ibqp,
 	struct ib_device *ibdev = &hr_dev->ib_dev;
 	dma_addr_t trrl_ba;
 	dma_addr_t irrl_ba;
-	enum ib_mtu mtu;
+	enum ib_mtu ib_mtu;
 	u8 lp_pktn_ini;
 	u64 *mtts;
 	u8 *dmac;
 	u8 *smac;
 	u32 port;
+	int mtu;
 	int ret;
 
 	ret = config_qp_rq_buf(hr_dev, hr_qp, context, qpc_mask);
@@ -4574,19 +4599,23 @@ static int modify_qp_init_to_rtr(struct ib_qp *ibqp,
 	roce_set_field(qpc_mask->byte_52_udpspn_dmac, V2_QPC_BYTE_52_DMAC_M,
 		       V2_QPC_BYTE_52_DMAC_S, 0);
 
-	mtu = get_mtu(ibqp, attr);
-	hr_qp->path_mtu = mtu;
+	ib_mtu = get_mtu(ibqp, attr);
+	hr_qp->path_mtu = ib_mtu;
+
+	mtu = ib_mtu_enum_to_int(ib_mtu);
+	if (WARN_ON(mtu < 0))
+		return -EINVAL;
 
 	if (attr_mask & IB_QP_PATH_MTU) {
 		roce_set_field(context->byte_24_mtu_tc, V2_QPC_BYTE_24_MTU_M,
-			       V2_QPC_BYTE_24_MTU_S, mtu);
+			       V2_QPC_BYTE_24_MTU_S, ib_mtu);
 		roce_set_field(qpc_mask->byte_24_mtu_tc, V2_QPC_BYTE_24_MTU_M,
 			       V2_QPC_BYTE_24_MTU_S, 0);
 	}
 
-#define MAX_LP_MSG_LEN 65536
-	/* MTU * (2 ^ LP_PKTN_INI) shouldn't be bigger than 64KB */
-	lp_pktn_ini = ilog2(MAX_LP_MSG_LEN / ib_mtu_enum_to_int(mtu));
+#define MAX_LP_MSG_LEN 16384
+	/* MTU * (2 ^ LP_PKTN_INI) shouldn't be bigger than 16KB */
+	lp_pktn_ini = ilog2(MAX_LP_MSG_LEN / mtu);
 
 	roce_set_field(context->byte_56_dqpn_err, V2_QPC_BYTE_56_LP_PKTN_INI_M,
 		       V2_QPC_BYTE_56_LP_PKTN_INI_S, lp_pktn_ini);
@@ -4716,8 +4745,10 @@ static int get_dip_ctx_idx(struct ib_qp *ibqp, const struct ib_qp_attr *attr,
 	spin_lock_irqsave(&hr_dev->dip_list_lock, flags);
 
 	list_for_each_entry(hr_dip, &hr_dev->dip_list, node) {
-		if (!memcmp(grh->dgid.raw, hr_dip->dgid, 16))
+		if (!memcmp(grh->dgid.raw, hr_dip->dgid, 16)) {
+			*dip_idx = hr_dip->dip_idx;
 			goto out;
+		}
 	}
 
 	/* If no dgid is found, a new dip and a mapping between dgid and
@@ -4758,6 +4789,11 @@ enum {
 	DIP_VALID,
 };
 
+enum {
+	WND_LIMIT,
+	WND_UNLIMIT,
+};
+
 static int check_cong_type(struct ib_qp *ibqp,
 			   struct hns_roce_congestion_algorithm *cong_alg)
 {
@@ -4769,21 +4805,25 @@ static int check_cong_type(struct ib_qp *ibqp,
 		cong_alg->alg_sel = CONG_DCQCN;
 		cong_alg->alg_sub_sel = UNSUPPORT_CONG_LEVEL;
 		cong_alg->dip_vld = DIP_INVALID;
+		cong_alg->wnd_mode_sel = WND_LIMIT;
 		break;
 	case CONG_TYPE_LDCP:
 		cong_alg->alg_sel = CONG_WINDOW;
 		cong_alg->alg_sub_sel = CONG_LDCP;
 		cong_alg->dip_vld = DIP_INVALID;
+		cong_alg->wnd_mode_sel = WND_UNLIMIT;
 		break;
 	case CONG_TYPE_HC3:
 		cong_alg->alg_sel = CONG_WINDOW;
 		cong_alg->alg_sub_sel = CONG_HC3;
 		cong_alg->dip_vld = DIP_INVALID;
+		cong_alg->wnd_mode_sel = WND_LIMIT;
 		break;
 	case CONG_TYPE_DIP:
 		cong_alg->alg_sel = CONG_DCQCN;
 		cong_alg->alg_sub_sel = UNSUPPORT_CONG_LEVEL;
 		cong_alg->dip_vld = DIP_VALID;
+		cong_alg->wnd_mode_sel = WND_LIMIT;
 		break;
 	default:
 		ibdev_err(&hr_dev->ib_dev,
@@ -4824,6 +4864,9 @@ static int fill_cong_field(struct ib_qp *ibqp, const struct ib_qp_attr *attr,
 	hr_reg_write(&qpc_mask->ext, QPCEX_CONG_ALG_SUB_SEL, 0);
 	hr_reg_write(&context->ext, QPCEX_DIP_CTX_IDX_VLD, cong_field.dip_vld);
 	hr_reg_write(&qpc_mask->ext, QPCEX_DIP_CTX_IDX_VLD, 0);
+	hr_reg_write(&context->ext, QPCEX_SQ_RQ_NOT_FORBID_EN,
+		     cong_field.wnd_mode_sel);
+	hr_reg_clear(&qpc_mask->ext, QPCEX_SQ_RQ_NOT_FORBID_EN);
 
 	/* if dip is disabled, there is no need to set dip idx */
 	if (cong_field.dip_vld == 0)
@@ -6736,10 +6779,8 @@ static int hns_roce_hw_v2_reset_notify_down(struct hnae3_handle *handle)
 	if (!hr_dev)
 		return 0;
 
-	hr_dev->is_reset = true;
 	hr_dev->active = false;
 	hr_dev->dis_db = true;
-
 	hr_dev->state = HNS_ROCE_DEVICE_STATE_RST_DOWN;
 
 	return 0;

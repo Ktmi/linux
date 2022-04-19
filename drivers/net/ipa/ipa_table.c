@@ -174,7 +174,7 @@ ipa_table_valid_one(struct ipa *ipa, bool route, bool ipv6, bool hashed)
 		size = (1 + IPA_FILTER_COUNT_MAX) * sizeof(__le64);
 	}
 
-	if (!ipa_cmd_table_valid(ipa, mem, route, ipv6, hashed))
+	if (!ipa_cmd_table_valid(ipa, mem, route))
 		return false;
 
 	/* mem->size >= size is sufficient, but we'll demand more */
@@ -450,7 +450,8 @@ static void ipa_table_init_add(struct gsi_trans *trans, bool filter,
 	 * table region determines the number of entries it has.
 	 */
 	if (filter) {
-		count = hweight32(ipa->filter_map);
+		/* Include one extra "slot" to hold the filter map itself */
+		count = 1 + hweight32(ipa->filter_map);
 		hash_count = hash_mem->size ? count : 0;
 	} else {
 		count = mem->size / sizeof(__le64);

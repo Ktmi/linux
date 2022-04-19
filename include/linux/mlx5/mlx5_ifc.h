@@ -918,7 +918,8 @@ struct mlx5_ifc_per_protocol_networking_offload_caps_bits {
 	u8         scatter_fcs[0x1];
 	u8         enhanced_multi_pkt_send_wqe[0x1];
 	u8         tunnel_lso_const_out_ip_id[0x1];
-	u8         reserved_at_1c[0x2];
+	u8         tunnel_lro_gre[0x1];
+	u8         tunnel_lro_vxlan[0x1];
 	u8         tunnel_stateless_gre[0x1];
 	u8         tunnel_stateless_vxlan[0x1];
 
@@ -1629,7 +1630,9 @@ struct mlx5_ifc_cmd_hca_cap_bits {
 	u8         steering_format_version[0x4];
 	u8         create_qp_start_hint[0x18];
 
-	u8         reserved_at_460[0x3];
+	u8         reserved_at_460[0x1];
+	u8         ats[0x1];
+	u8         reserved_at_462[0x1];
 	u8         log_max_uctx[0x5];
 	u8         reserved_at_468[0x2];
 	u8         ipsec_offload[0x1];
@@ -3641,7 +3644,9 @@ struct mlx5_ifc_mkc_bits {
 	u8         lw[0x1];
 	u8         lr[0x1];
 	u8         access_mode_1_0[0x2];
-	u8         reserved_at_18[0x8];
+	u8         reserved_at_18[0x2];
+	u8         ma_translation_mode[0x2];
+	u8         reserved_at_1c[0x4];
 
 	u8         qpn[0x18];
 	u8         mkey_7_0[0x8];
@@ -9460,16 +9465,22 @@ struct mlx5_ifc_pcmr_reg_bits {
 	u8         reserved_at_0[0x8];
 	u8         local_port[0x8];
 	u8         reserved_at_10[0x10];
+
 	u8         entropy_force_cap[0x1];
 	u8         entropy_calc_cap[0x1];
 	u8         entropy_gre_calc_cap[0x1];
-	u8         reserved_at_23[0x1b];
+	u8         reserved_at_23[0xf];
+	u8         rx_ts_over_crc_cap[0x1];
+	u8         reserved_at_33[0xb];
 	u8         fcs_cap[0x1];
 	u8         reserved_at_3f[0x1];
+
 	u8         entropy_force[0x1];
 	u8         entropy_calc[0x1];
 	u8         entropy_gre_calc[0x1];
-	u8         reserved_at_43[0x1b];
+	u8         reserved_at_43[0xf];
+	u8         rx_ts_over_crc[0x1];
+	u8         reserved_at_53[0xb];
 	u8         fcs_chk[0x1];
 	u8         reserved_at_5f[0x1];
 };
@@ -10619,7 +10630,8 @@ struct mlx5_ifc_general_obj_out_cmd_hdr_bits {
 struct mlx5_ifc_umem_bits {
 	u8         reserved_at_0[0x80];
 
-	u8         reserved_at_80[0x1b];
+	u8         ats[0x1];
+	u8         reserved_at_81[0x1a];
 	u8         log_page_size[0x5];
 
 	u8         page_offset[0x20];

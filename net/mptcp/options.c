@@ -323,7 +323,8 @@ static void mptcp_parse_option(const struct sk_buff *skb,
 	}
 }
 
-void mptcp_get_options(const struct sk_buff *skb,
+void mptcp_get_options(const struct sock *sk,
+		       const struct sk_buff *skb,
 		       struct mptcp_options_received *mp_opt)
 {
 	const struct tcphdr *th = tcp_hdr(skb);
@@ -398,28 +399,6 @@ bool mptcp_syn_options(struct sock *sk, const struct sk_buff *skb,
 	return false;
 }
 
-/* MP_JOIN client subflow must wait for 4th ack before sending any data:
- * TCP can't schedule delack timer before the subflow is fully established.
- * MPTCP uses the delack timer to do 3rd ack retransmissions
- */
-static void schedule_3rdack_retransmission(struct sock *sk)
-{
-	struct inet_connection_sock *icsk = inet_csk(sk);
-	struct tcp_sock *tp = tcp_sk(sk);
-	unsigned long timeout;
-
-	/* reschedule with a timeout above RTT, as we must look only for drop */
-	if (tp->srtt_us)
-		timeout = tp->srtt_us << 1;
-	else
-		timeout = TCP_TIMEOUT_INIT;
-
-	WARN_ON_ONCE(icsk->icsk_ack.pending & ICSK_ACK_TIMER);
-	icsk->icsk_ack.pending |= ICSK_ACK_SCHED | ICSK_ACK_TIMER;
-	icsk->icsk_ack.timeout = timeout;
-	sk_reset_timer(sk, &icsk->icsk_delack_timer, timeout);
-}
-
 static void clear_3rdack_retransmission(struct sock *sk)
 {
 	struct inet_connection_sock *icsk = inet_csk(sk);
@@ -489,7 +468,15 @@ static bool mptcp_established_options_mp(struct sock *sk, struct sk_buff *skb,
 		*size = TCPOLEN_MPTCP_MPJ_ACK;
 		pr_debug("subflow=%p", subflow);
 
-		schedule_3rdack_retransmission(sk);
+		/* we can use the full delegate action helper only from BH context
+		 * If we are in process context - sk is flushing the backlog at
+		 * socket lock release time - just set the appropriate flag, will
+		 * be handled by the release callback
+		 */
+		if (sock_owned_by_user(sk))
+			set_bit(MPTCP_DELEGATE_ACK, &subflow->delegated_status);
+		else
+			mptcp_subflow_delegate(subflow, MPTCP_DELEGATE_ACK);
 		return true;
 	}
 	return false;
@@ -842,18 +829,14 @@ static bool check_fully_established(struct mptcp_sock *msk, struct sock *ssk,
 		return subflow->mp_capable;
 	}
 
-	if (mp_opt->dss && mp_opt->use_ack) {
+	if ((mp_opt->dss && mp_opt->use_ack) ||
+	    (mp_opt->add_addr && !mp_opt->echo)) {
 		/* subflows are fully established as soon as we get any
-		 * additional ack.
+		 * additional ack, including ADD_ADDR.
 		 */
 		subflow->fully_established = 1;
 		WRITE_ONCE(msk->fully_established, true);
 		goto fully_established;
-	}
-
-	if (mp_opt->add_addr) {
-		WRITE_ONCE(msk->fully_established, true);
-		return true;
 	}
 
 	/* If the first established packet does not contain MP_CAPABLE + data
@@ -896,19 +879,20 @@ reset:
 	return false;
 }
 
-static u64 expand_ack(u64 old_ack, u64 cur_ack, bool use_64bit)
+u64 __mptcp_expand_seq(u64 old_seq, u64 cur_seq)
 {
-	u32 old_ack32, cur_ack32;
+	u32 old_seq32, cur_seq32;
 
-	if (use_64bit)
-		return cur_ack;
+	old_seq32 = (u32)old_seq;
+	cur_seq32 = (u32)cur_seq;
+	cur_seq = (old_seq & GENMASK_ULL(63, 32)) + cur_seq32;
+	if (unlikely(cur_seq32 < old_seq32 && before(old_seq32, cur_seq32)))
+		return cur_seq + (1LL << 32);
 
-	old_ack32 = (u32)old_ack;
-	cur_ack32 = (u32)cur_ack;
-	cur_ack = (old_ack & GENMASK_ULL(63, 32)) + cur_ack32;
-	if (unlikely(before(cur_ack32, old_ack32)))
-		return cur_ack + (1LL << 32);
-	return cur_ack;
+	/* reverse wrap could happen, too */
+	if (unlikely(cur_seq32 > old_seq32 && after(old_seq32, cur_seq32)))
+		return cur_seq - (1LL << 32);
+	return cur_seq;
 }
 
 static void ack_update_msk(struct mptcp_sock *msk,
@@ -926,7 +910,7 @@ static void ack_update_msk(struct mptcp_sock *msk,
 	 * more dangerous than missing an ack
 	 */
 	old_snd_una = msk->snd_una;
-	new_snd_una = expand_ack(old_snd_una, mp_opt->data_ack, mp_opt->ack64);
+	new_snd_una = mptcp_expand_seq(old_snd_una, mp_opt->data_ack, mp_opt->ack64);
 
 	/* ACK for data not even sent yet? Ignore. */
 	if (after64(new_snd_una, snd_nxt))
@@ -963,7 +947,7 @@ bool mptcp_update_rcv_data_fin(struct mptcp_sock *msk, u64 data_fin_seq, bool us
 		return false;
 
 	WRITE_ONCE(msk->rcv_data_fin_seq,
-		   expand_ack(READ_ONCE(msk->ack_seq), data_fin_seq, use_64bit));
+		   mptcp_expand_seq(READ_ONCE(msk->ack_seq), data_fin_seq, use_64bit));
 	WRITE_ONCE(msk->rcv_data_fin, 1);
 
 	return true;
@@ -988,7 +972,8 @@ static bool add_addr_hmac_valid(struct mptcp_sock *msk,
 	return hmac == mp_opt->ahmac;
 }
 
-void mptcp_incoming_options(struct sock *sk, struct sk_buff *skb)
+/* Return false if a subflow has been reset, else return true */
+bool mptcp_incoming_options(struct sock *sk, struct sk_buff *skb)
 {
 	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(sk);
 	struct mptcp_sock *msk = mptcp_sk(subflow->conn);
@@ -1006,12 +991,16 @@ void mptcp_incoming_options(struct sock *sk, struct sk_buff *skb)
 			__mptcp_check_push(subflow->conn, sk);
 		__mptcp_data_acked(subflow->conn);
 		mptcp_data_unlock(subflow->conn);
-		return;
+		return true;
 	}
 
-	mptcp_get_options(skb, &mp_opt);
+	mptcp_get_options(sk, skb, &mp_opt);
+
+	/* The subflow can be in close state only if check_fully_established()
+	 * just sent a reset. If so, tell the caller to ignore the current packet.
+	 */
 	if (!check_fully_established(msk, sk, subflow, skb, &mp_opt))
-		return;
+		return sk->sk_state != TCP_CLOSE;
 
 	if (mp_opt.fastclose &&
 	    msk->local_key == mp_opt.rcvr_key) {
@@ -1053,7 +1042,7 @@ void mptcp_incoming_options(struct sock *sk, struct sk_buff *skb)
 	}
 
 	if (!mp_opt.dss)
-		return;
+		return true;
 
 	/* we can't wait for recvmsg() to update the ack_seq, otherwise
 	 * monodirectional flows will stuck
@@ -1072,12 +1061,12 @@ void mptcp_incoming_options(struct sock *sk, struct sk_buff *skb)
 		    schedule_work(&msk->work))
 			sock_hold(subflow->conn);
 
-		return;
+		return true;
 	}
 
 	mpext = skb_ext_add(skb, SKB_EXT_MPTCP);
 	if (!mpext)
-		return;
+		return true;
 
 	memset(mpext, 0, sizeof(*mpext));
 
@@ -1102,6 +1091,8 @@ void mptcp_incoming_options(struct sock *sk, struct sk_buff *skb)
 		mpext->data_len = mp_opt.data_len;
 		mpext->use_map = 1;
 	}
+
+	return true;
 }
 
 static void mptcp_set_rwin(const struct tcp_sock *tp)

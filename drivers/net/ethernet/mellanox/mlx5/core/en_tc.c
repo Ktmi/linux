@@ -424,12 +424,32 @@ static void mlx5e_detach_mod_hdr(struct mlx5e_priv *priv,
 static
 struct mlx5_core_dev *mlx5e_hairpin_get_mdev(struct net *net, int ifindex)
 {
+	struct mlx5_core_dev *mdev;
 	struct net_device *netdev;
 	struct mlx5e_priv *priv;
 
-	netdev = __dev_get_by_index(net, ifindex);
+	netdev = dev_get_by_index(net, ifindex);
+	if (!netdev)
+		return ERR_PTR(-ENODEV);
+
 	priv = netdev_priv(netdev);
-	return priv->mdev;
+	mdev = priv->mdev;
+	dev_put(netdev);
+
+	/* Mirred tc action holds a refcount on the ifindex net_device (see
+	 * net/sched/act_mirred.c:tcf_mirred_get_dev). So, it's okay to continue using mdev
+	 * after dev_put(netdev), while we're in the context of adding a tc flow.
+	 *
+	 * The mdev pointer corresponds to the peer/out net_device of a hairpin. It is then
+	 * stored in a hairpin object, which exists until all flows, that refer to it, get
+	 * removed.
+	 *
+	 * On the other hand, after a hairpin object has been created, the peer net_device may
+	 * be removed/unbound while there are still some hairpin flows that are using it. This
+	 * case is handled by mlx5e_tc_hairpin_update_dead_peer, which is hooked to
+	 * NETDEV_UNREGISTER event of the peer net_device.
+	 */
+	return mdev;
 }
 
 static int mlx5e_hairpin_create_transport(struct mlx5e_hairpin *hp)
@@ -638,6 +658,10 @@ mlx5e_hairpin_create(struct mlx5e_priv *priv, struct mlx5_hairpin_params *params
 
 	func_mdev = priv->mdev;
 	peer_mdev = mlx5e_hairpin_get_mdev(dev_net(priv->netdev), peer_ifindex);
+	if (IS_ERR(peer_mdev)) {
+		err = PTR_ERR(peer_mdev);
+		goto create_pair_err;
+	}
 
 	pair = mlx5_core_hairpin_create(func_mdev, peer_mdev, params);
 	if (IS_ERR(pair)) {
@@ -776,6 +800,11 @@ static int mlx5e_hairpin_flow_add(struct mlx5e_priv *priv,
 	int err;
 
 	peer_mdev = mlx5e_hairpin_get_mdev(dev_net(priv->netdev), peer_ifindex);
+	if (IS_ERR(peer_mdev)) {
+		NL_SET_ERR_MSG_MOD(extack, "invalid ifindex of mirred device");
+		return PTR_ERR(peer_mdev);
+	}
+
 	if (!MLX5_CAP_GEN(priv->mdev, hairpin) || !MLX5_CAP_GEN(peer_mdev, hairpin)) {
 		NL_SET_ERR_MSG_MOD(extack, "hairpin is not supported");
 		return -EOPNOTSUPP;
@@ -1281,6 +1310,7 @@ bool mlx5e_tc_is_vf_tunnel(struct net_device *out_dev, struct net_device *route_
 int mlx5e_tc_query_route_vport(struct net_device *out_dev, struct net_device *route_dev, u16 *vport)
 {
 	struct mlx5e_priv *out_priv, *route_priv;
+	struct mlx5_devcom *devcom = NULL;
 	struct mlx5_core_dev *route_mdev;
 	struct mlx5_eswitch *esw;
 	u16 vhca_id;
@@ -1292,7 +1322,24 @@ int mlx5e_tc_query_route_vport(struct net_device *out_dev, struct net_device *ro
 	route_mdev = route_priv->mdev;
 
 	vhca_id = MLX5_CAP_GEN(route_mdev, vhca_id);
+	if (mlx5_lag_is_active(out_priv->mdev)) {
+		/* In lag case we may get devices from different eswitch instances.
+		 * If we failed to get vport num, it means, mostly, that we on the wrong
+		 * eswitch.
+		 */
+		err = mlx5_eswitch_vhca_id_to_vport(esw, vhca_id, vport);
+		if (err != -ENOENT)
+			return err;
+
+		devcom = out_priv->mdev->priv.devcom;
+		esw = mlx5_devcom_get_peer_data(devcom, MLX5_DEVCOM_ESW_OFFLOADS);
+		if (!esw)
+			return -ENODEV;
+	}
+
 	err = mlx5_eswitch_vhca_id_to_vport(esw, vhca_id, vport);
+	if (devcom)
+		mlx5_devcom_release_peer_data(devcom, MLX5_DEVCOM_ESW_OFFLOADS);
 	return err;
 }
 
@@ -1488,6 +1535,7 @@ static void mlx5e_tc_del_fdb_flow(struct mlx5e_priv *priv,
 		else
 			mlx5e_tc_unoffload_fdb_rules(esw, flow, attr);
 	}
+	complete_all(&flow->del_hw_done);
 
 	if (mlx5_flow_has_geneve_opt(flow))
 		mlx5_geneve_tlv_option_del(priv->mdev->geneve);
@@ -1823,6 +1871,111 @@ u8 mlx5e_tc_get_ip_version(struct mlx5_flow_spec *spec, bool outer)
 	return ip_version;
 }
 
+/* Tunnel device follows RFC 6040, see include/net/inet_ecn.h.
+ * And changes inner ip_ecn depending on inner and outer ip_ecn as follows:
+ *      +---------+----------------------------------------+
+ *      |Arriving |         Arriving Outer Header          |
+ *      |   Inner +---------+---------+---------+----------+
+ *      |  Header | Not-ECT | ECT(0)  | ECT(1)  |   CE     |
+ *      +---------+---------+---------+---------+----------+
+ *      | Not-ECT | Not-ECT | Not-ECT | Not-ECT | <drop>   |
+ *      |  ECT(0) |  ECT(0) | ECT(0)  | ECT(1)  |   CE*    |
+ *      |  ECT(1) |  ECT(1) | ECT(1)  | ECT(1)* |   CE*    |
+ *      |    CE   |   CE    |  CE     | CE      |   CE     |
+ *      +---------+---------+---------+---------+----------+
+ *
+ * Tc matches on inner after decapsulation on tunnel device, but hw offload matches
+ * the inner ip_ecn value before hardware decap action.
+ *
+ * Cells marked are changed from original inner packet ip_ecn value during decap, and
+ * so matching those values on inner ip_ecn before decap will fail.
+ *
+ * The following helper allows offload when inner ip_ecn won't be changed by outer ip_ecn,
+ * except for the outer ip_ecn = CE, where in all cases inner ip_ecn will be changed to CE,
+ * and such we can drop the inner ip_ecn=CE match.
+ */
+
+static int mlx5e_tc_verify_tunnel_ecn(struct mlx5e_priv *priv,
+				      struct flow_cls_offload *f,
+				      bool *match_inner_ecn)
+{
+	u8 outer_ecn_mask = 0, outer_ecn_key = 0, inner_ecn_mask = 0, inner_ecn_key = 0;
+	struct flow_rule *rule = flow_cls_offload_flow_rule(f);
+	struct netlink_ext_ack *extack = f->common.extack;
+	struct flow_match_ip match;
+
+	*match_inner_ecn = true;
+
+	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ENC_IP)) {
+		flow_rule_match_enc_ip(rule, &match);
+		outer_ecn_key = match.key->tos & INET_ECN_MASK;
+		outer_ecn_mask = match.mask->tos & INET_ECN_MASK;
+	}
+
+	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IP)) {
+		flow_rule_match_ip(rule, &match);
+		inner_ecn_key = match.key->tos & INET_ECN_MASK;
+		inner_ecn_mask = match.mask->tos & INET_ECN_MASK;
+	}
+
+	if (outer_ecn_mask != 0 && outer_ecn_mask != INET_ECN_MASK) {
+		NL_SET_ERR_MSG_MOD(extack, "Partial match on enc_tos ecn bits isn't supported");
+		netdev_warn(priv->netdev, "Partial match on enc_tos ecn bits isn't supported");
+		return -EOPNOTSUPP;
+	}
+
+	if (!outer_ecn_mask) {
+		if (!inner_ecn_mask)
+			return 0;
+
+		NL_SET_ERR_MSG_MOD(extack,
+				   "Matching on tos ecn bits without also matching enc_tos ecn bits isn't supported");
+		netdev_warn(priv->netdev,
+			    "Matching on tos ecn bits without also matching enc_tos ecn bits isn't supported");
+		return -EOPNOTSUPP;
+	}
+
+	if (inner_ecn_mask && inner_ecn_mask != INET_ECN_MASK) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "Partial match on tos ecn bits with match on enc_tos ecn bits isn't supported");
+		netdev_warn(priv->netdev,
+			    "Partial match on tos ecn bits with match on enc_tos ecn bits isn't supported");
+		return -EOPNOTSUPP;
+	}
+
+	if (!inner_ecn_mask)
+		return 0;
+
+	/* Both inner and outer have full mask on ecn */
+
+	if (outer_ecn_key == INET_ECN_ECT_1) {
+		/* inner ecn might change by DECAP action */
+
+		NL_SET_ERR_MSG_MOD(extack, "Match on enc_tos ecn = ECT(1) isn't supported");
+		netdev_warn(priv->netdev, "Match on enc_tos ecn = ECT(1) isn't supported");
+		return -EOPNOTSUPP;
+	}
+
+	if (outer_ecn_key != INET_ECN_CE)
+		return 0;
+
+	if (inner_ecn_key != INET_ECN_CE) {
+		/* Can't happen in software, as packet ecn will be changed to CE after decap */
+		NL_SET_ERR_MSG_MOD(extack,
+				   "Match on tos enc_tos ecn = CE while match on tos ecn != CE isn't supported");
+		netdev_warn(priv->netdev,
+			    "Match on tos enc_tos ecn = CE while match on tos ecn != CE isn't supported");
+		return -EOPNOTSUPP;
+	}
+
+	/* outer ecn = CE, inner ecn = CE, as decap will change inner ecn to CE in anycase,
+	 * drop match on inner ecn
+	 */
+	*match_inner_ecn = false;
+
+	return 0;
+}
+
 static int parse_tunnel_attr(struct mlx5e_priv *priv,
 			     struct mlx5e_tc_flow *flow,
 			     struct mlx5_flow_spec *spec,
@@ -2016,6 +2169,7 @@ static int __parse_cls_flower(struct mlx5e_priv *priv,
 	struct flow_rule *rule = flow_cls_offload_flow_rule(f);
 	struct flow_dissector *dissector = rule->match.dissector;
 	enum fs_flow_table_type fs_type;
+	bool match_inner_ecn = true;
 	u16 addr_type = 0;
 	u8 ip_proto = 0;
 	u8 *match_level;
@@ -2069,6 +2223,10 @@ static int __parse_cls_flower(struct mlx5e_priv *priv,
 			headers_c = get_match_inner_headers_criteria(spec);
 			headers_v = get_match_inner_headers_value(spec);
 		}
+
+		err = mlx5e_tc_verify_tunnel_ecn(priv, f, &match_inner_ecn);
+		if (err)
+			return err;
 	}
 
 	err = mlx5e_flower_parse_meta(filter_dev, f);
@@ -2290,10 +2448,12 @@ static int __parse_cls_flower(struct mlx5e_priv *priv,
 		struct flow_match_ip match;
 
 		flow_rule_match_ip(rule, &match);
-		MLX5_SET(fte_match_set_lyr_2_4, headers_c, ip_ecn,
-			 match.mask->tos & 0x3);
-		MLX5_SET(fte_match_set_lyr_2_4, headers_v, ip_ecn,
-			 match.key->tos & 0x3);
+		if (match_inner_ecn) {
+			MLX5_SET(fte_match_set_lyr_2_4, headers_c, ip_ecn,
+				 match.mask->tos & 0x3);
+			MLX5_SET(fte_match_set_lyr_2_4, headers_v, ip_ecn,
+				 match.key->tos & 0x3);
+		}
 
 		MLX5_SET(fte_match_set_lyr_2_4, headers_c, ip_dscp,
 			 match.mask->tos >> 2);
@@ -3395,7 +3555,9 @@ static int parse_tc_nic_actions(struct mlx5e_priv *priv,
 			attr->dest_chain = act->chain_index;
 			break;
 		case FLOW_ACTION_CT:
-			err = mlx5_tc_ct_parse_action(get_ct_priv(priv), attr, act, extack);
+			err = mlx5_tc_ct_parse_action(get_ct_priv(priv), attr,
+						      &parse_attr->mod_hdr_acts,
+						      act, extack);
 			if (err)
 				return err;
 
@@ -3947,7 +4109,9 @@ static int parse_tc_fdb_actions(struct mlx5e_priv *priv,
 				NL_SET_ERR_MSG_MOD(extack, "Sample action with connection tracking is not supported");
 				return -EOPNOTSUPP;
 			}
-			err = mlx5_tc_ct_parse_action(get_ct_priv(priv), attr, act, extack);
+			err = mlx5_tc_ct_parse_action(get_ct_priv(priv), attr,
+						      &parse_attr->mod_hdr_acts,
+						      act, extack);
 			if (err)
 				return err;
 
@@ -4161,6 +4325,7 @@ mlx5e_alloc_flow(struct mlx5e_priv *priv, int attr_size,
 	INIT_LIST_HEAD(&flow->l3_to_l2_reformat);
 	refcount_set(&flow->refcnt, 1);
 	init_completion(&flow->init_done);
+	init_completion(&flow->del_hw_done);
 
 	*__flow = flow;
 	*__parse_attr = parse_attr;

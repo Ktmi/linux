@@ -59,7 +59,7 @@ static void idxd_device_reinit(struct work_struct *work)
 	return;
 
  out:
-	idxd_device_wqs_clear_state(idxd);
+	idxd_device_clear_state(idxd);
 }
 
 static void idxd_device_fault_work(struct work_struct *work)
@@ -109,6 +109,9 @@ static int process_misc_interrupts(struct idxd_device *idxd, u32 cause)
 	u32 val = 0;
 	int i;
 	bool err = false;
+
+	if (cause & IDXD_INTC_HALT_STATE)
+		goto halt;
 
 	if (cause & IDXD_INTC_ERR) {
 		spin_lock_bh(&idxd->dev_lock);
@@ -177,6 +180,7 @@ static int process_misc_interrupts(struct idxd_device *idxd, u32 cause)
 	    idxd->sw_err.fault_addr)
 		idxd_device_schedule_fault_process(idxd, idxd->sw_err.fault_addr);
 
+halt:
 	gensts.bits = ioread32(idxd->reg_base + IDXD_GENSTATS_OFFSET);
 	if (gensts.state == IDXD_DEVICE_STATE_HALT) {
 		idxd->state = IDXD_DEV_HALTED;
@@ -189,10 +193,11 @@ static int process_misc_interrupts(struct idxd_device *idxd, u32 cause)
 			INIT_WORK(&idxd->work, idxd_device_reinit);
 			queue_work(idxd->wq, &idxd->work);
 		} else {
-			spin_lock_bh(&idxd->dev_lock);
+			idxd->state = IDXD_DEV_HALTED;
 			idxd_wqs_quiesce(idxd);
 			idxd_wqs_unmap_portal(idxd);
-			idxd_device_wqs_clear_state(idxd);
+			spin_lock_bh(&idxd->dev_lock);
+			idxd_device_clear_state(idxd);
 			dev_err(&idxd->pdev->dev,
 				"idxd halted, need %s.\n",
 				gensts.reset_type == IDXD_DEVICE_RESET_FLR ?
@@ -245,12 +250,6 @@ static inline bool match_fault(struct idxd_desc *desc, u64 fault_addr)
 	return false;
 }
 
-static inline void complete_desc(struct idxd_desc *desc, enum idxd_complete_type reason)
-{
-	idxd_dma_complete_txd(desc, reason);
-	idxd_free_desc(desc->wq, desc);
-}
-
 static int irq_process_pending_llist(struct idxd_irq_entry *irq_entry,
 				     enum irq_work_type wtype,
 				     int *processed, u64 data)
@@ -272,8 +271,20 @@ static int irq_process_pending_llist(struct idxd_irq_entry *irq_entry,
 		reason = IDXD_COMPLETE_DEV_FAIL;
 
 	llist_for_each_entry_safe(desc, t, head, llnode) {
-		if (desc->completion->status) {
-			if ((desc->completion->status & DSA_COMP_STATUS_MASK) != DSA_COMP_SUCCESS)
+		u8 status = desc->completion->status & DSA_COMP_STATUS_MASK;
+
+		if (status) {
+			/*
+			 * Check against the original status as ABORT is software defined
+			 * and 0xff, which DSA_COMP_STATUS_MASK can mask out.
+			 */
+			if (unlikely(desc->completion->status == IDXD_COMP_DESC_ABORT)) {
+				complete_desc(desc, IDXD_COMPLETE_ABORT);
+				(*processed)++;
+				continue;
+			}
+
+			if (unlikely(status != DSA_COMP_SUCCESS))
 				match_fault(desc, data);
 			complete_desc(desc, reason);
 			(*processed)++;
@@ -329,7 +340,18 @@ static int irq_process_work_list(struct idxd_irq_entry *irq_entry,
 	spin_unlock_irqrestore(&irq_entry->list_lock, flags);
 
 	list_for_each_entry(desc, &flist, list) {
-		if ((desc->completion->status & DSA_COMP_STATUS_MASK) != DSA_COMP_SUCCESS)
+		u8 status = desc->completion->status & DSA_COMP_STATUS_MASK;
+
+		/*
+		 * Check against the original status as ABORT is software defined
+		 * and 0xff, which DSA_COMP_STATUS_MASK can mask out.
+		 */
+		if (unlikely(desc->completion->status == IDXD_COMP_DESC_ABORT)) {
+			complete_desc(desc, IDXD_COMPLETE_ABORT);
+			continue;
+		}
+
+		if (unlikely(status != DSA_COMP_SUCCESS))
 			match_fault(desc, data);
 		complete_desc(desc, reason);
 	}

@@ -42,6 +42,8 @@ static const struct acpi_device_id lps0_device_ids[] = {
 
 /* AMD */
 #define ACPI_LPS0_DSM_UUID_AMD      "e3f32452-febc-43ce-9039-932122d37721"
+#define ACPI_LPS0_ENTRY_AMD         2
+#define ACPI_LPS0_EXIT_AMD          3
 #define ACPI_LPS0_SCREEN_OFF_AMD    4
 #define ACPI_LPS0_SCREEN_ON_AMD     5
 
@@ -384,11 +386,15 @@ static int lps0_device_attach(struct acpi_device *adev,
 		mem_sleep_current = PM_SUSPEND_TO_IDLE;
 
 	/*
-	 * Some LPS0 systems, like ASUS Zenbook UX430UNR/i7-8550U, require the
-	 * EC GPE to be enabled while suspended for certain wakeup devices to
-	 * work, so mark it as wakeup-capable.
+	 * Some Intel based LPS0 systems, like ASUS Zenbook UX430UNR/i7-8550U don't
+	 * use intel-hid or intel-vbtn but require the EC GPE to be enabled while
+	 * suspended for certain wakeup devices to work, so mark it as wakeup-capable.
+	 *
+	 * Only enable on !AMD as enabling this universally causes problems for a number
+	 * of AMD based systems.
 	 */
-	acpi_ec_mark_gpe_for_wake();
+	if (!acpi_s2idle_vendor_amd())
+		acpi_ec_mark_gpe_for_wake();
 
 	return 0;
 }
@@ -408,6 +414,7 @@ int acpi_s2idle_prepare_late(void)
 
 	if (acpi_s2idle_vendor_amd()) {
 		acpi_sleep_run_lps0_dsm(ACPI_LPS0_SCREEN_OFF_AMD);
+		acpi_sleep_run_lps0_dsm(ACPI_LPS0_ENTRY_AMD);
 	} else {
 		acpi_sleep_run_lps0_dsm(ACPI_LPS0_SCREEN_OFF);
 		acpi_sleep_run_lps0_dsm(ACPI_LPS0_ENTRY);
@@ -422,6 +429,7 @@ void acpi_s2idle_restore_early(void)
 		return;
 
 	if (acpi_s2idle_vendor_amd()) {
+		acpi_sleep_run_lps0_dsm(ACPI_LPS0_EXIT_AMD);
 		acpi_sleep_run_lps0_dsm(ACPI_LPS0_SCREEN_ON_AMD);
 	} else {
 		acpi_sleep_run_lps0_dsm(ACPI_LPS0_EXIT);

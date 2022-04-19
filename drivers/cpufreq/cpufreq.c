@@ -1003,10 +1003,9 @@ static struct kobj_type ktype_cpufreq = {
 	.release	= cpufreq_sysfs_release,
 };
 
-static void add_cpu_dev_symlink(struct cpufreq_policy *policy, unsigned int cpu)
+static void add_cpu_dev_symlink(struct cpufreq_policy *policy, unsigned int cpu,
+				struct device *dev)
 {
-	struct device *dev = get_cpu_device(cpu);
-
 	if (unlikely(!dev))
 		return;
 
@@ -1367,9 +1366,14 @@ static int cpufreq_online(unsigned int cpu)
 			goto out_free_policy;
 		}
 
+		/*
+		 * The initialization has succeeded and the policy is online.
+		 * If there is a problem with its frequency table, take it
+		 * offline and drop it.
+		 */
 		ret = cpufreq_table_validate_and_sort(policy);
 		if (ret)
-			goto out_exit_policy;
+			goto out_offline_policy;
 
 		/* related_cpus should at least include policy->cpus. */
 		cpumask_copy(policy->related_cpus, policy->cpus);
@@ -1385,7 +1389,7 @@ static int cpufreq_online(unsigned int cpu)
 	if (new_policy) {
 		for_each_cpu(j, policy->related_cpus) {
 			per_cpu(cpufreq_cpu_data, j) = policy;
-			add_cpu_dev_symlink(policy, j);
+			add_cpu_dev_symlink(policy, j, get_cpu_device(j));
 		}
 
 		policy->min_freq_req = kzalloc(2 * sizeof(*policy->min_freq_req),
@@ -1397,7 +1401,7 @@ static int cpufreq_online(unsigned int cpu)
 
 		ret = freq_qos_add_request(&policy->constraints,
 					   policy->min_freq_req, FREQ_QOS_MIN,
-					   policy->min);
+					   FREQ_QOS_MIN_DEFAULT_VALUE);
 		if (ret < 0) {
 			/*
 			 * So we don't call freq_qos_remove_request() for an
@@ -1417,7 +1421,7 @@ static int cpufreq_online(unsigned int cpu)
 
 		ret = freq_qos_add_request(&policy->constraints,
 					   policy->max_freq_req, FREQ_QOS_MAX,
-					   policy->max);
+					   FREQ_QOS_MAX_DEFAULT_VALUE);
 		if (ret < 0) {
 			policy->max_freq_req = NULL;
 			goto out_destroy_policy;
@@ -1515,6 +1519,10 @@ out_destroy_policy:
 
 	up_write(&policy->rwsem);
 
+out_offline_policy:
+	if (cpufreq_driver->offline)
+		cpufreq_driver->offline(policy);
+
 out_exit_policy:
 	if (cpufreq_driver->exit)
 		cpufreq_driver->exit(policy);
@@ -1546,7 +1554,7 @@ static int cpufreq_add_dev(struct device *dev, struct subsys_interface *sif)
 	/* Create sysfs link on CPU registration */
 	policy = per_cpu(cpufreq_cpu_data, cpu);
 	if (policy)
-		add_cpu_dev_symlink(policy, cpu);
+		add_cpu_dev_symlink(policy, cpu, dev);
 
 	return 0;
 }
@@ -2737,6 +2745,20 @@ static int cpuhp_cpufreq_offline(unsigned int cpu)
 	return 0;
 }
 
+static char cpufreq_driver_name[CPUFREQ_NAME_LEN];
+
+static int __init cpufreq_driver_setup(char *str)
+{
+	strlcpy(cpufreq_driver_name, str, CPUFREQ_NAME_LEN);
+	return 1;
+}
+
+/*
+ * Set this name to only allow one specific cpu freq driver, e.g.,
+ * cpufreq_driver=powernow-k8
+ */
+__setup("cpufreq_driver=", cpufreq_driver_setup);
+
 /**
  * cpufreq_register_driver - register a CPU Frequency driver
  * @driver_data: A struct cpufreq_driver containing the values#
@@ -2771,7 +2793,13 @@ int cpufreq_register_driver(struct cpufreq_driver *driver_data)
 	     (!driver_data->online != !driver_data->offline))
 		return -EINVAL;
 
-	pr_debug("trying to register driver %s\n", driver_data->name);
+	pr_debug("trying to register driver %s, cpufreq_driver=%s\n",
+		driver_data->name, cpufreq_driver_name);
+
+	if (cpufreq_driver_name[0])
+		if (!driver_data->name ||
+			strcmp(cpufreq_driver_name, driver_data->name))
+				return -EINVAL;
 
 	/* Protect against concurrent CPU online/offline. */
 	cpus_read_lock();

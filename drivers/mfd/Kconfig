@@ -465,6 +465,7 @@ config MFD_MP2629
 	tristate "Monolithic Power Systems MP2629 ADC and Battery charger"
 	depends on I2C
 	select REGMAP_I2C
+	select MFD_CORE
 	help
 	  Select this option to enable support for Monolithic Power Systems
 	  battery charger. This provides ADC, thermal and battery charger power
@@ -2104,6 +2105,18 @@ config MFD_ACER_A500_EC
 	  Support for Embedded Controller found on Acer Iconia Tab A500.
 	  The controller itself is ENE KB930, it is running firmware
 	  customized for the specific needs of the Acer A500 hardware.
+
+config MFD_AAEON
+	tristate "AAEON WMI MFD devices"
+	depends on ASUS_WMI
+	depends on UBUNTU_ODM_DRIVERS
+	help
+	  Say yes here to support mltiple IO devices on Single Board Computers
+	  produced by AAEON.
+
+	  This driver leverages the ASUS WMI interface to access device
+	  resources.
+
 
 menu "Multimedia Capabilities Port drivers"
 	depends on ARCH_SA1100

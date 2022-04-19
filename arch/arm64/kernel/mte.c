@@ -165,12 +165,7 @@ bool mte_report_once(void)
 #ifdef CONFIG_KASAN_HW_TAGS
 void mte_check_tfsr_el1(void)
 {
-	u64 tfsr_el1;
-
-	if (!system_supports_mte())
-		return;
-
-	tfsr_el1 = read_sysreg_s(SYS_TFSR_EL1);
+	u64 tfsr_el1 = read_sysreg_s(SYS_TFSR_EL1);
 
 	if (unlikely(tfsr_el1 & SYS_TFSR_EL1_TF1)) {
 		/*
@@ -184,18 +179,6 @@ void mte_check_tfsr_el1(void)
 	}
 }
 #endif
-
-static void update_gcr_el1_excl(u64 excl)
-{
-
-	/*
-	 * Note that the mask controlled by the user via prctl() is an
-	 * include while GCR_EL1 accepts an exclude mask.
-	 * No need for ISB since this only affects EL0 currently, implicit
-	 * with ERET.
-	 */
-	sysreg_clear_set_s(SYS_GCR_EL1, SYS_GCR_EL1_EXCL_MASK, excl);
-}
 
 static void set_gcr_el1_excl(u64 excl)
 {
@@ -225,6 +208,9 @@ void mte_thread_init_user(void)
 
 void mte_thread_switch(struct task_struct *next)
 {
+	if (!system_supports_mte())
+		return;
+
 	/*
 	 * Check if an async tag exception occurred at EL1.
 	 *
@@ -257,7 +243,8 @@ void mte_suspend_exit(void)
 	if (!system_supports_mte())
 		return;
 
-	update_gcr_el1_excl(gcr_kernel_excl);
+	sysreg_clear_set_s(SYS_GCR_EL1, SYS_GCR_EL1_EXCL_MASK, gcr_kernel_excl);
+	isb();
 }
 
 long set_mte_ctrl(struct task_struct *task, unsigned long arg)

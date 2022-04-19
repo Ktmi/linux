@@ -23,6 +23,8 @@ enum hl_device_status hl_device_status(struct hl_device *hdev)
 		status = HL_DEVICE_STATUS_NEEDS_RESET;
 	else if (hdev->disabled)
 		status = HL_DEVICE_STATUS_MALFUNCTION;
+	else if (!hdev->init_done)
+		status = HL_DEVICE_STATUS_IN_DEVICE_CREATION;
 	else
 		status = HL_DEVICE_STATUS_OPERATIONAL;
 
@@ -44,6 +46,7 @@ bool hl_device_operational(struct hl_device *hdev,
 	case HL_DEVICE_STATUS_NEEDS_RESET:
 		return false;
 	case HL_DEVICE_STATUS_OPERATIONAL:
+	case HL_DEVICE_STATUS_IN_DEVICE_CREATION:
 	default:
 		return true;
 	}
@@ -1334,8 +1337,9 @@ int hl_device_init(struct hl_device *hdev, struct class *hclass)
 	}
 
 	/*
-	 * From this point, in case of an error, add char devices and create
-	 * sysfs nodes as part of the error flow, to allow debugging.
+	 * From this point, override rc (=0) in case of an error to allow
+	 * debugging (by adding char devices and create sysfs nodes as part of
+	 * the error flow).
 	 */
 	add_cdev_sysfs_on_err = true;
 

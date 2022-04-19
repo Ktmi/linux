@@ -109,6 +109,7 @@
 #define MPTCP_ERROR_REPORT	8
 #define MPTCP_RETRANSMIT	9
 #define MPTCP_WORK_SYNC_SETSOCKOPT 10
+#define MPTCP_CONNECTED		11
 
 static inline bool before64(__u64 seq1, __u64 seq2)
 {
@@ -235,7 +236,6 @@ struct mptcp_sock {
 	bool		rcv_fastclose;
 	bool		use_64bit_ack; /* Set when we received a 64-bit DSN */
 	spinlock_t	join_list_lock;
-	struct sock	*ack_hint;
 	struct work_struct work;
 	struct sk_buff  *ooo_last_skb;
 	struct rb_root  out_of_order_queue;
@@ -290,9 +290,17 @@ static inline struct mptcp_sock *mptcp_sk(const struct sock *sk)
 	return (struct mptcp_sock *)sk;
 }
 
+/* the msk socket don't use the backlog, also account for the bulk
+ * free memory
+ */
+static inline int __mptcp_rmem(const struct sock *sk)
+{
+	return atomic_read(&sk->sk_rmem_alloc) - READ_ONCE(mptcp_sk(sk)->rmem_released);
+}
+
 static inline int __mptcp_space(const struct sock *sk)
 {
-	return tcp_space(sk) + READ_ONCE(mptcp_sk(sk)->rmem_released);
+	return tcp_win_from_space(sk, READ_ONCE(sk->sk_rcvbuf) - __mptcp_rmem(sk));
 }
 
 static inline struct mptcp_data_frag *mptcp_send_head(const struct sock *sk)
@@ -372,6 +380,7 @@ struct mptcp_delegated_action {
 DECLARE_PER_CPU(struct mptcp_delegated_action, mptcp_delegated_actions);
 
 #define MPTCP_DELEGATE_SEND		0
+#define MPTCP_DELEGATE_ACK		1
 
 /* MPTCP subflow context */
 struct mptcp_subflow_context {
@@ -469,22 +478,22 @@ static inline void mptcp_add_pending_subflow(struct mptcp_sock *msk,
 
 void mptcp_subflow_process_delegated(struct sock *ssk);
 
-static inline void mptcp_subflow_delegate(struct mptcp_subflow_context *subflow)
+static inline void mptcp_subflow_delegate(struct mptcp_subflow_context *subflow, int action)
 {
 	struct mptcp_delegated_action *delegated;
 	bool schedule;
+
+	/* the caller held the subflow bh socket lock */
+	lockdep_assert_in_softirq();
 
 	/* The implied barrier pairs with mptcp_subflow_delegated_done(), and
 	 * ensures the below list check sees list updates done prior to status
 	 * bit changes
 	 */
-	if (!test_and_set_bit(MPTCP_DELEGATE_SEND, &subflow->delegated_status)) {
+	if (!test_and_set_bit(action, &subflow->delegated_status)) {
 		/* still on delegated list from previous scheduling */
 		if (!list_empty(&subflow->delegated_node))
 			return;
-
-		/* the caller held the subflow bh socket lock */
-		lockdep_assert_in_softirq();
 
 		delegated = this_cpu_ptr(&mptcp_delegated_actions);
 		schedule = list_empty(&delegated->head);
@@ -510,16 +519,16 @@ mptcp_subflow_delegated_next(struct mptcp_delegated_action *delegated)
 
 static inline bool mptcp_subflow_has_delegated_action(const struct mptcp_subflow_context *subflow)
 {
-	return test_bit(MPTCP_DELEGATE_SEND, &subflow->delegated_status);
+	return !!READ_ONCE(subflow->delegated_status);
 }
 
-static inline void mptcp_subflow_delegated_done(struct mptcp_subflow_context *subflow)
+static inline void mptcp_subflow_delegated_done(struct mptcp_subflow_context *subflow, int action)
 {
 	/* pairs with mptcp_subflow_delegate, ensures delegate_node is updated before
 	 * touching the status bit
 	 */
 	smp_wmb();
-	clear_bit(MPTCP_DELEGATE_SEND, &subflow->delegated_status);
+	clear_bit(action, &subflow->delegated_status);
 }
 
 int mptcp_is_enabled(struct net *net);
@@ -531,6 +540,7 @@ void __init mptcp_subflow_init(void);
 void mptcp_subflow_shutdown(struct sock *sk, struct sock *ssk, int how);
 void mptcp_close_ssk(struct sock *sk, struct sock *ssk,
 		     struct mptcp_subflow_context *subflow);
+void mptcp_subflow_send_ack(struct sock *ssk);
 void mptcp_subflow_reset(struct sock *ssk);
 void mptcp_sock_graft(struct sock *sk, struct socket *parent);
 struct socket *__mptcp_nmpc_socket(const struct mptcp_sock *msk);
@@ -575,10 +585,12 @@ int __init mptcp_proto_v6_init(void);
 struct sock *mptcp_sk_clone(const struct sock *sk,
 			    const struct mptcp_options_received *mp_opt,
 			    struct request_sock *req);
-void mptcp_get_options(const struct sk_buff *skb,
+void mptcp_get_options(const struct sock *sk,
+		       const struct sk_buff *skb,
 		       struct mptcp_options_received *mp_opt);
 
 void mptcp_finish_connect(struct sock *sk);
+void __mptcp_set_connected(struct sock *sk);
 static inline bool mptcp_is_fully_established(struct sock *sk)
 {
 	return inet_sk_state_load(sk) == TCP_ESTABLISHED &&
@@ -593,6 +605,14 @@ int mptcp_setsockopt(struct sock *sk, int level, int optname,
 int mptcp_getsockopt(struct sock *sk, int level, int optname,
 		     char __user *optval, int __user *option);
 
+u64 __mptcp_expand_seq(u64 old_seq, u64 cur_seq);
+static inline u64 mptcp_expand_seq(u64 old_seq, u64 cur_seq, bool use_64bit)
+{
+	if (use_64bit)
+		return cur_seq;
+
+	return __mptcp_expand_seq(old_seq, cur_seq);
+}
 void __mptcp_check_push(struct sock *sk, struct sock *ssk);
 void __mptcp_data_acked(struct sock *sk);
 void __mptcp_error_report(struct sock *sk);
@@ -638,7 +658,7 @@ int mptcp_token_new_connect(struct sock *sk);
 void mptcp_token_accept(struct mptcp_subflow_request_sock *r,
 			struct mptcp_sock *msk);
 bool mptcp_token_exists(u32 token);
-struct mptcp_sock *mptcp_token_get_sock(u32 token);
+struct mptcp_sock *mptcp_token_get_sock(struct net *net, u32 token);
 struct mptcp_sock *mptcp_token_iter_next(const struct net *net, long *s_slot,
 					 long *s_num);
 void mptcp_token_destroy(struct mptcp_sock *msk);

@@ -1611,6 +1611,7 @@ static bool acpi_device_enumeration_by_parent(struct acpi_device *device)
 {
 	struct list_head resource_list;
 	bool is_serial_bus_slave = false;
+	static const struct acpi_device_id ignore_serial_bus_ids[] = {
 	/*
 	 * These devices have multiple I2cSerialBus resources and an i2c-client
 	 * must be instantiated for each, each with its own i2c_device_id.
@@ -1619,11 +1620,18 @@ static bool acpi_device_enumeration_by_parent(struct acpi_device *device)
 	 * drivers/platform/x86/i2c-multi-instantiate.c driver, which knows
 	 * which i2c_device_id to use for each resource.
 	 */
-	static const struct acpi_device_id i2c_multi_instantiate_ids[] = {
 		{"BSG1160", },
 		{"BSG2150", },
 		{"INT33FE", },
 		{"INT3515", },
+	/*
+	 * HIDs of device with an UartSerialBusV2 resource for which userspace
+	 * expects a regular tty cdev to be created (instead of the in kernel
+	 * serdev) and which have a kernel driver which expects a platform_dev
+	 * such as the rfkill-gpio driver.
+	 */
+		{"BCM4752", },
+		{"LNV4752", },
 		{}
 	};
 
@@ -1637,8 +1645,7 @@ static bool acpi_device_enumeration_by_parent(struct acpi_device *device)
 	     fwnode_property_present(&device->fwnode, "baud")))
 		return true;
 
-	/* Instantiate a pdev for the i2c-multi-instantiate drv to bind to */
-	if (!acpi_match_device_ids(device, i2c_multi_instantiate_ids))
+	if (!acpi_match_device_ids(device, ignore_serial_bus_ids))
 		return false;
 
 	INIT_LIST_HEAD(&resource_list);
@@ -1671,8 +1678,20 @@ void acpi_init_device_object(struct acpi_device *device, acpi_handle handle,
 	device_initialize(&device->dev);
 	dev_set_uevent_suppress(&device->dev, true);
 	acpi_init_coherency(device);
-	/* Assume there are unmet deps to start with. */
-	device->dep_unmet = 1;
+}
+
+static void acpi_scan_dep_init(struct acpi_device *adev)
+{
+	struct acpi_dep_data *dep;
+
+	mutex_lock(&acpi_dep_list_lock);
+
+	list_for_each_entry(dep, &acpi_dep_list, node) {
+		if (dep->consumer == adev->handle)
+			adev->dep_unmet++;
+	}
+
+	mutex_unlock(&acpi_dep_list_lock);
 }
 
 void acpi_device_add_finalize(struct acpi_device *device)
@@ -1688,7 +1707,7 @@ static void acpi_scan_init_status(struct acpi_device *adev)
 }
 
 static int acpi_add_single_object(struct acpi_device **child,
-				  acpi_handle handle, int type)
+				  acpi_handle handle, int type, bool dep_init)
 {
 	struct acpi_device *device;
 	int result;
@@ -1703,8 +1722,12 @@ static int acpi_add_single_object(struct acpi_device **child,
 	 * acpi_bus_get_status() and use its quirk handling.  Note that
 	 * this must be done before the get power-/wakeup_dev-flags calls.
 	 */
-	if (type == ACPI_BUS_TYPE_DEVICE || type == ACPI_BUS_TYPE_PROCESSOR)
+	if (type == ACPI_BUS_TYPE_DEVICE || type == ACPI_BUS_TYPE_PROCESSOR) {
+		if (dep_init)
+			acpi_scan_dep_init(device);
+
 		acpi_scan_init_status(device);
+	}
 
 	acpi_bus_get_power_flags(device);
 	acpi_bus_get_wakeup_device_flags(device);
@@ -1886,22 +1909,6 @@ static u32 acpi_scan_check_dep(acpi_handle handle, bool check_dep)
 	return count;
 }
 
-static void acpi_scan_dep_init(struct acpi_device *adev)
-{
-	struct acpi_dep_data *dep;
-
-	adev->dep_unmet = 0;
-
-	mutex_lock(&acpi_dep_list_lock);
-
-	list_for_each_entry(dep, &acpi_dep_list, node) {
-		if (dep->consumer == adev->handle)
-			adev->dep_unmet++;
-	}
-
-	mutex_unlock(&acpi_dep_list_lock);
-}
-
 static bool acpi_bus_scan_second_pass;
 
 static acpi_status acpi_bus_check_add(acpi_handle handle, bool check_dep,
@@ -1949,19 +1956,15 @@ static acpi_status acpi_bus_check_add(acpi_handle handle, bool check_dep,
 		return AE_OK;
 	}
 
-	acpi_add_single_object(&device, handle, type);
-	if (!device)
-		return AE_CTRL_DEPTH;
-
-	acpi_scan_init_hotplug(device);
 	/*
 	 * If check_dep is true at this point, the device has no dependencies,
 	 * or the creation of the device object would have been postponed above.
 	 */
-	if (check_dep)
-		device->dep_unmet = 0;
-	else
-		acpi_scan_dep_init(device);
+	acpi_add_single_object(&device, handle, type, !check_dep);
+	if (!device)
+		return AE_CTRL_DEPTH;
+
+	acpi_scan_init_hotplug(device);
 
 out:
 	if (!*adev_p)
@@ -2223,7 +2226,7 @@ int acpi_bus_register_early_device(int type)
 	struct acpi_device *device = NULL;
 	int result;
 
-	result = acpi_add_single_object(&device, NULL, type);
+	result = acpi_add_single_object(&device, NULL, type, false);
 	if (result)
 		return result;
 
@@ -2243,7 +2246,7 @@ static int acpi_bus_scan_fixed(void)
 		struct acpi_device *device = NULL;
 
 		result = acpi_add_single_object(&device, NULL,
-						ACPI_BUS_TYPE_POWER_BUTTON);
+						ACPI_BUS_TYPE_POWER_BUTTON, false);
 		if (result)
 			return result;
 
@@ -2259,7 +2262,7 @@ static int acpi_bus_scan_fixed(void)
 		struct acpi_device *device = NULL;
 
 		result = acpi_add_single_object(&device, NULL,
-						ACPI_BUS_TYPE_SLEEP_BUTTON);
+						ACPI_BUS_TYPE_SLEEP_BUTTON, false);
 		if (result)
 			return result;
 

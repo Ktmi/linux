@@ -357,11 +357,18 @@ static int dsa_port_setup(struct dsa_port *dp)
 {
 	struct devlink_port *dlp = &dp->devlink_port;
 	bool dsa_port_link_registered = false;
+	struct dsa_switch *ds = dp->ds;
 	bool dsa_port_enabled = false;
 	int err = 0;
 
 	if (dp->setup)
 		return 0;
+
+	if (ds->ops->port_setup) {
+		err = ds->ops->port_setup(ds, dp->index);
+		if (err)
+			return err;
+	}
 
 	switch (dp->type) {
 	case DSA_PORT_TYPE_UNUSED:
@@ -405,8 +412,11 @@ static int dsa_port_setup(struct dsa_port *dp)
 		dsa_port_disable(dp);
 	if (err && dsa_port_link_registered)
 		dsa_port_link_unregister_of(dp);
-	if (err)
+	if (err) {
+		if (ds->ops->port_teardown)
+			ds->ops->port_teardown(ds, dp->index);
 		return err;
+	}
 
 	dp->setup = true;
 
@@ -458,9 +468,13 @@ static int dsa_port_devlink_setup(struct dsa_port *dp)
 static void dsa_port_teardown(struct dsa_port *dp)
 {
 	struct devlink_port *dlp = &dp->devlink_port;
+	struct dsa_switch *ds = dp->ds;
 
 	if (!dp->setup)
 		return;
+
+	if (ds->ops->port_teardown)
+		ds->ops->port_teardown(ds, dp->index);
 
 	devlink_port_type_clear(dlp);
 
@@ -493,6 +507,36 @@ static void dsa_port_devlink_teardown(struct dsa_port *dp)
 	if (dp->devlink_port_setup)
 		devlink_port_unregister(dlp);
 	dp->devlink_port_setup = false;
+}
+
+/* Destroy the current devlink port, and create a new one which has the UNUSED
+ * flavour. At this point, any call to ds->ops->port_setup has been already
+ * balanced out by a call to ds->ops->port_teardown, so we know that any
+ * devlink port regions the driver had are now unregistered. We then call its
+ * ds->ops->port_setup again, in order for the driver to re-create them on the
+ * new devlink port.
+ */
+static int dsa_port_reinit_as_unused(struct dsa_port *dp)
+{
+	struct dsa_switch *ds = dp->ds;
+	int err;
+
+	dsa_port_devlink_teardown(dp);
+	dp->type = DSA_PORT_TYPE_UNUSED;
+	err = dsa_port_devlink_setup(dp);
+	if (err)
+		return err;
+
+	if (ds->ops->port_setup) {
+		/* On error, leave the devlink port registered,
+		 * dsa_switch_teardown will clean it up later.
+		 */
+		err = ds->ops->port_setup(ds, dp->index);
+		if (err)
+			return err;
+	}
+
+	return 0;
 }
 
 static int dsa_devlink_info_get(struct devlink *dl,
@@ -749,7 +793,7 @@ static int dsa_switch_setup(struct dsa_switch *ds)
 	devlink_params_publish(ds->devlink);
 
 	if (!ds->slave_mii_bus && ds->ops->phy_read) {
-		ds->slave_mii_bus = devm_mdiobus_alloc(ds->dev);
+		ds->slave_mii_bus = mdiobus_alloc();
 		if (!ds->slave_mii_bus) {
 			err = -ENOMEM;
 			goto teardown;
@@ -759,13 +803,16 @@ static int dsa_switch_setup(struct dsa_switch *ds)
 
 		err = mdiobus_register(ds->slave_mii_bus);
 		if (err < 0)
-			goto teardown;
+			goto free_slave_mii_bus;
 	}
 
 	ds->setup = true;
 
 	return 0;
 
+free_slave_mii_bus:
+	if (ds->slave_mii_bus && ds->ops->phy_read)
+		mdiobus_free(ds->slave_mii_bus);
 teardown:
 	if (ds->ops->teardown)
 		ds->ops->teardown(ds);
@@ -790,8 +837,11 @@ static void dsa_switch_teardown(struct dsa_switch *ds)
 	if (!ds->setup)
 		return;
 
-	if (ds->slave_mii_bus && ds->ops->phy_read)
+	if (ds->slave_mii_bus && ds->ops->phy_read) {
 		mdiobus_unregister(ds->slave_mii_bus);
+		mdiobus_free(ds->slave_mii_bus);
+		ds->slave_mii_bus = NULL;
+	}
 
 	dsa_switch_unregister_notifier(ds);
 
@@ -824,12 +874,9 @@ static int dsa_tree_setup_switches(struct dsa_switch_tree *dst)
 	list_for_each_entry(dp, &dst->ports, list) {
 		err = dsa_port_setup(dp);
 		if (err) {
-			dsa_port_devlink_teardown(dp);
-			dp->type = DSA_PORT_TYPE_UNUSED;
-			err = dsa_port_devlink_setup(dp);
+			err = dsa_port_reinit_as_unused(dp);
 			if (err)
 				goto teardown;
-			continue;
 		}
 	}
 
@@ -1220,12 +1267,15 @@ static int dsa_switch_parse_ports_of(struct dsa_switch *ds,
 
 	for_each_available_child_of_node(ports, port) {
 		err = of_property_read_u32(port, "reg", &reg);
-		if (err)
+		if (err) {
+			of_node_put(port);
 			goto out_put_node;
+		}
 
 		if (reg >= ds->num_ports) {
 			dev_err(ds->dev, "port %pOF index %u exceeds num_ports (%zu)\n",
 				port, reg, ds->num_ports);
+			of_node_put(port);
 			err = -EINVAL;
 			goto out_put_node;
 		}
@@ -1233,8 +1283,10 @@ static int dsa_switch_parse_ports_of(struct dsa_switch *ds,
 		dp = dsa_to_port(ds, reg);
 
 		err = dsa_port_parse_of(dp, port);
-		if (err)
+		if (err) {
+			of_node_put(port);
 			goto out_put_node;
+		}
 	}
 
 out_put_node:

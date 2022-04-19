@@ -340,10 +340,16 @@ static bool exception_common(int signr, struct pt_regs *regs, int code,
 		return false;
 	}
 
-	show_signal_msg(signr, regs, code, addr);
+	/*
+	 * Must not enable interrupts even for user-mode exception, because
+	 * this can be called from machine check, which may be a NMI or IRQ
+	 * which don't like interrupts being enabled. Could check for
+	 * in_hardirq || in_nmi perhaps, but there doesn't seem to be a good
+	 * reason why _exception() should enable irqs for an exception handler,
+	 * the handlers themselves do that directly.
+	 */
 
-	if (arch_irqs_disabled())
-		interrupt_cond_local_irq_enable(regs);
+	show_signal_msg(signr, regs, code, addr);
 
 	current->thread.trap_nr = code;
 
@@ -1103,7 +1109,7 @@ DEFINE_INTERRUPT_HANDLER(RunModeException)
 	_exception(SIGTRAP, regs, TRAP_UNK, 0);
 }
 
-DEFINE_INTERRUPT_HANDLER(single_step_exception)
+static void __single_step_exception(struct pt_regs *regs)
 {
 	clear_single_step(regs);
 	clear_br_trace(regs);
@@ -1120,6 +1126,11 @@ DEFINE_INTERRUPT_HANDLER(single_step_exception)
 	_exception(SIGTRAP, regs, TRAP_TRACE, regs->nip);
 }
 
+DEFINE_INTERRUPT_HANDLER(single_step_exception)
+{
+	__single_step_exception(regs);
+}
+
 /*
  * After we have successfully emulated an instruction, we have to
  * check if the instruction was being single-stepped, and if so,
@@ -1129,7 +1140,7 @@ DEFINE_INTERRUPT_HANDLER(single_step_exception)
 static void emulate_single_step(struct pt_regs *regs)
 {
 	if (single_stepping(regs))
-		single_step_exception(regs);
+		__single_step_exception(regs);
 }
 
 static inline int __parse_fpscr(unsigned long fpscr)

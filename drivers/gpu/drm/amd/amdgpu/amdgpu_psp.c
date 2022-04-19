@@ -229,7 +229,7 @@ int psp_wait_for(struct psp_context *psp, uint32_t reg_index,
 	int i;
 	struct amdgpu_device *adev = psp->adev;
 
-	if (psp->adev->in_pci_err_recovery)
+	if (psp->adev->no_hw_access)
 		return 0;
 
 	for (i = 0; i < adev->usec_timeout; i++) {
@@ -258,7 +258,7 @@ psp_cmd_submit_buf(struct psp_context *psp,
 	bool ras_intr = false;
 	bool skip_unsupport = false;
 
-	if (psp->adev->in_pci_err_recovery)
+	if (psp->adev->no_hw_access)
 		return 0;
 
 	mutex_lock(&psp->mutex);
@@ -1931,12 +1931,16 @@ static int psp_hw_start(struct psp_context *psp)
 		DRM_WARN("PSP set boot config@\n");
 	}
 
+	if (amdgpu_sriov_vf(adev) && amdgpu_in_reset(adev))
+		goto skip_pin_bo;
+
 	ret = psp_tmr_init(psp);
 	if (ret) {
 		DRM_ERROR("PSP tmr init failed!\n");
 		return ret;
 	}
 
+skip_pin_bo:
 	/*
 	 * For ASICs with DF Cstate management centralized
 	 * to PMFW, TMR setup should be performed after PMFW

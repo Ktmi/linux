@@ -14,6 +14,7 @@
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/suspend.h>
+#include "dual_accel_detect.h"
 
 /* When NOT in tablet mode, VGBS returns with the flag 0x40 */
 #define TABLET_MODE_FLAG BIT(6)
@@ -116,11 +117,30 @@ static const struct dmi_system_id dmi_vgbs_allow_list[] = {
 	{ }
 };
 
+/*
+ * Some devices, even non convertible ones, can send incorrect SW_TABLET_MODE
+ * reports. Accept such reports only from devices in this list.
+ */
+static const struct dmi_system_id dmi_auto_add_switch[] = {
+	{
+		.matches = {
+			DMI_EXACT_MATCH(DMI_CHASSIS_TYPE, "31" /* Convertible */),
+		},
+	},
+	{
+		.matches = {
+			DMI_EXACT_MATCH(DMI_CHASSIS_TYPE, "32" /* Detachable */),
+		},
+	},
+	{} /* Array terminator */
+};
+
 struct intel_hid_priv {
 	struct input_dev *input_dev;
 	struct input_dev *array;
 	struct input_dev *switches;
 	bool wakeup_mode;
+	bool auto_add_switch;
 };
 
 #define HID_EVENT_FILTER_UUID	"eeec56b3-4442-408f-a792-4edd4d758054"
@@ -449,23 +469,8 @@ static void notify_handler(acpi_handle handle, u32 event, void *context)
 	 * Some convertible have unreliable VGBS return which could cause incorrect
 	 * SW_TABLET_MODE report, in these cases we enable support when receiving
 	 * the first event instead of during driver setup.
-	 *
-	 * Some 360 degree hinges (yoga) style 2-in-1 devices use 2 accelerometers
-	 * to allow the OS to determine the angle between the display and the base
-	 * of the device. On Windows these are read by a special HingeAngleService
-	 * process which calls an ACPI DSM (Device Specific Method) on the
-	 * ACPI KIOX010A device node for the sensor in the display, to let the
-	 * firmware know if the 2-in-1 is in tablet- or laptop-mode so that it can
-	 * disable the kbd and touchpad to avoid spurious input in tablet-mode.
-	 *
-	 * The linux kxcjk1013 driver calls the DSM for this once at probe time
-	 * to ensure that the builtin kbd and touchpad work. On some devices this
-	 * causes a "spurious" 0xcd event on the intel-hid ACPI dev. In this case
-	 * there is not a functional tablet-mode switch, so we should not register
-	 * the tablet-mode switch device.
 	 */
-	if (!priv->switches && (event == 0xcc || event == 0xcd) &&
-	    !acpi_dev_present("KIOX010A", NULL, -1)) {
+	if (!priv->switches && priv->auto_add_switch && (event == 0xcc || event == 0xcd)) {
 		dev_info(&device->dev, "switch event received, enable switches supports\n");
 		err = intel_hid_switches_setup(device);
 		if (err)
@@ -605,6 +610,9 @@ static int intel_hid_probe(struct platform_device *device)
 	if (!priv)
 		return -ENOMEM;
 	dev_set_drvdata(&device->dev, priv);
+
+	/* See dual_accel_detect.h for more info on the dual_accel check. */
+	priv->auto_add_switch = dmi_check_system(dmi_auto_add_switch) && !dual_accel_detect();
 
 	err = intel_hid_input_setup(device);
 	if (err) {

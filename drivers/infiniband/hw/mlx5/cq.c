@@ -734,9 +734,9 @@ static int create_cq_user(struct mlx5_ib_dev *dev, struct ib_udata *udata,
 
 	*cqe_size = ucmd.cqe_size;
 
-	cq->buf.umem =
-		ib_umem_get(&dev->ib_dev, ucmd.buf_addr,
-			    entries * ucmd.cqe_size, IB_ACCESS_LOCAL_WRITE);
+	cq->buf.umem = ib_umem_get_peer(&dev->ib_dev, ucmd.buf_addr,
+					entries * ucmd.cqe_size,
+					IB_ACCESS_LOCAL_WRITE, 0);
 	if (IS_ERR(cq->buf.umem)) {
 		err = PTR_ERR(cq->buf.umem);
 		return err;
@@ -941,7 +941,6 @@ int mlx5_ib_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
 	u32 *cqb = NULL;
 	void *cqc;
 	int cqe_size;
-	unsigned int irqn;
 	int eqn;
 	int err;
 
@@ -980,7 +979,7 @@ int mlx5_ib_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
 		INIT_WORK(&cq->notify_work, notify_soft_wc_handler);
 	}
 
-	err = mlx5_vector2eqn(dev->mdev, vector, &eqn, &irqn);
+	err = mlx5_vector2eqn(dev->mdev, vector, &eqn);
 	if (err)
 		goto err_cqb;
 
@@ -1003,7 +1002,6 @@ int mlx5_ib_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
 		goto err_cqb;
 
 	mlx5_ib_dbg(dev, "cqn 0x%x\n", cq->mcq.cqn);
-	cq->mcq.irqn = irqn;
 	if (udata)
 		cq->mcq.tasklet_ctx.comp = mlx5_ib_cq_comp;
 	else
@@ -1156,9 +1154,9 @@ static int resize_user(struct mlx5_ib_dev *dev, struct mlx5_ib_cq *cq,
 	if (ucmd.cqe_size && SIZE_MAX / ucmd.cqe_size <= entries - 1)
 		return -EINVAL;
 
-	umem = ib_umem_get(&dev->ib_dev, ucmd.buf_addr,
-			   (size_t)ucmd.cqe_size * entries,
-			   IB_ACCESS_LOCAL_WRITE);
+	umem = ib_umem_get_peer(&dev->ib_dev, ucmd.buf_addr,
+				(size_t)ucmd.cqe_size * entries,
+				IB_ACCESS_LOCAL_WRITE, 0);
 	if (IS_ERR(umem)) {
 		err = PTR_ERR(umem);
 		return err;

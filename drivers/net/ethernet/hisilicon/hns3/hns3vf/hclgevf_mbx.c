@@ -109,7 +109,8 @@ int hclgevf_send_mbx_msg(struct hclgevf_dev *hdev,
 
 	memcpy(&req->msg, send_msg, sizeof(struct hclge_vf_to_pf_msg));
 
-	trace_hclge_vf_mbx_send(hdev, req);
+	if (test_bit(HCLGEVF_STATE_NIC_REGISTERED, &hdev->state))
+		trace_hclge_vf_mbx_send(hdev, req);
 
 	/* synchronous send */
 	if (need_resp) {
@@ -304,8 +305,8 @@ void hclgevf_mbx_async_handler(struct hclgevf_dev *hdev)
 			flag = (u8)msg_q[5];
 
 			/* update upper layer with new link link status */
-			hclgevf_update_link_status(hdev, link_status);
 			hclgevf_update_speed_duplex(hdev, speed, duplex);
+			hclgevf_update_link_status(hdev, link_status);
 
 			if (flag & HCLGE_MBX_PUSH_LINK_STATUS_EN)
 				set_bit(HCLGEVF_STATE_PF_PUSH_LINK_STATUS,

@@ -177,7 +177,7 @@ struct vcpu_svm {
 
 	/* SEV-ES scratch area support */
 	void *ghcb_sa;
-	u64 ghcb_sa_len;
+	u32 ghcb_sa_len;
 	bool ghcb_sa_sync;
 	bool ghcb_sa_free;
 
@@ -441,7 +441,7 @@ static inline bool nested_exit_on_nmi(struct vcpu_svm *svm)
 }
 
 int enter_svm_guest_mode(struct kvm_vcpu *vcpu, u64 vmcb_gpa, struct vmcb *vmcb12);
-void svm_leave_nested(struct vcpu_svm *svm);
+void svm_leave_nested(struct kvm_vcpu *vcpu);
 void svm_free_nested(struct vcpu_svm *svm);
 int svm_allocate_nested(struct vcpu_svm *svm);
 int nested_svm_vmrun(struct kvm_vcpu *vcpu);

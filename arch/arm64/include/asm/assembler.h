@@ -108,6 +108,13 @@
 	.endm
 
 /*
+ * Clear Branch History instruction
+ */
+	.macro clearbhb
+	hint	#22
+	.endm
+
+/*
  * Speculation barrier
  */
 	.macro	sb
@@ -232,15 +239,23 @@ lr	.req	x30		// link register
 	 * @dst: destination register
 	 */
 #if defined(__KVM_NVHE_HYPERVISOR__) || defined(__KVM_VHE_HYPERVISOR__)
-	.macro	this_cpu_offset, dst
+	.macro	get_this_cpu_offset, dst
 	mrs	\dst, tpidr_el2
 	.endm
 #else
-	.macro	this_cpu_offset, dst
+	.macro	get_this_cpu_offset, dst
 alternative_if_not ARM64_HAS_VIRT_HOST_EXTN
 	mrs	\dst, tpidr_el1
 alternative_else
 	mrs	\dst, tpidr_el2
+alternative_endif
+	.endm
+
+	.macro	set_this_cpu_offset, src
+alternative_if_not ARM64_HAS_VIRT_HOST_EXTN
+	msr	tpidr_el1, \src
+alternative_else
+	msr	tpidr_el2, \src
 alternative_endif
 	.endm
 #endif
@@ -253,7 +268,7 @@ alternative_endif
 	.macro adr_this_cpu, dst, sym, tmp
 	adrp	\tmp, \sym
 	add	\dst, \tmp, #:lo12:\sym
-	this_cpu_offset \tmp
+	get_this_cpu_offset \tmp
 	add	\dst, \dst, \tmp
 	.endm
 
@@ -264,7 +279,7 @@ alternative_endif
 	 */
 	.macro ldr_this_cpu dst, sym, tmp
 	adr_l	\dst, \sym
-	this_cpu_offset \tmp
+	get_this_cpu_offset \tmp
 	ldr	\dst, [\dst, \tmp]
 	.endm
 
@@ -745,7 +760,7 @@ USER(\label, ic	ivau, \tmp2)			// invalidate I line PoU
 	cbz		\tmp, \lbl
 #endif
 	adr_l		\tmp, irq_stat + IRQ_CPUSTAT_SOFTIRQ_PENDING
-	this_cpu_offset	\tmp2
+	get_this_cpu_offset	\tmp2
 	ldr		w\tmp, [\tmp, \tmp2]
 	cbnz		w\tmp, \lbl	// yield on pending softirq in task context
 .Lnoyield_\@:
@@ -801,4 +816,50 @@ USER(\label, ic	ivau, \tmp2)			// invalidate I line PoU
 
 #endif /* GNU_PROPERTY_AARCH64_FEATURE_1_DEFAULT */
 
+	.macro __mitigate_spectre_bhb_loop      tmp
+#ifdef CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY
+alternative_cb  spectre_bhb_patch_loop_iter
+	mov	\tmp, #32		// Patched to correct the immediate
+alternative_cb_end
+.Lspectre_bhb_loop\@:
+	b	. + 4
+	subs	\tmp, \tmp, #1
+	b.ne	.Lspectre_bhb_loop\@
+	sb
+#endif /* CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY */
+	.endm
+
+	.macro mitigate_spectre_bhb_loop	tmp
+#ifdef CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY
+alternative_cb	spectre_bhb_patch_loop_mitigation_enable
+	b	.L_spectre_bhb_loop_done\@	// Patched to NOP
+alternative_cb_end
+	__mitigate_spectre_bhb_loop	\tmp
+.L_spectre_bhb_loop_done\@:
+#endif /* CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY */
+	.endm
+
+	/* Save/restores x0-x3 to the stack */
+	.macro __mitigate_spectre_bhb_fw
+#ifdef CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY
+	stp	x0, x1, [sp, #-16]!
+	stp	x2, x3, [sp, #-16]!
+	mov	w0, #ARM_SMCCC_ARCH_WORKAROUND_3
+alternative_cb	smccc_patch_fw_mitigation_conduit
+	nop					// Patched to SMC/HVC #0
+alternative_cb_end
+	ldp	x2, x3, [sp], #16
+	ldp	x0, x1, [sp], #16
+#endif /* CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY */
+	.endm
+
+	.macro mitigate_spectre_bhb_clear_insn
+#ifdef CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY
+alternative_cb	spectre_bhb_patch_clearbhb
+	/* Patched to NOP when not supported */
+	clearbhb
+	isb
+alternative_cb_end
+#endif /* CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY */
+	.endm
 #endif	/* __ASM_ASSEMBLER_H */

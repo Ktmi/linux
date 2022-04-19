@@ -251,8 +251,10 @@ struct vdpasim *vdpasim_create(struct vdpasim_dev_attr *dev_attr)
 
 	vdpasim = vdpa_alloc_device(struct vdpasim, vdpa, NULL, ops,
 				    dev_attr->name);
-	if (!vdpasim)
+	if (IS_ERR(vdpasim)) {
+		ret = PTR_ERR(vdpasim);
 		goto err_alloc;
+	}
 
 	vdpasim->dev_attr = *dev_attr;
 	INIT_WORK(&vdpasim->work, dev_attr->work_fn);
@@ -578,8 +580,11 @@ static void vdpasim_free(struct vdpa_device *vdpa)
 		vringh_kiov_cleanup(&vdpasim->vqs[i].in_iov);
 	}
 
-	put_iova_domain(&vdpasim->iova);
-	iova_cache_put();
+	if (vdpa_get_dma_dev(vdpa)) {
+		put_iova_domain(&vdpasim->iova);
+		iova_cache_put();
+	}
+
 	kvfree(vdpasim->buffer);
 	if (vdpasim->iommu)
 		vhost_iotlb_free(vdpasim->iommu);

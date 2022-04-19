@@ -1588,6 +1588,19 @@ config NIC7018_WDT
 	  To compile this driver as a module, choose M here: the module will be
 	  called nic7018_wdt.
 
+config AAEON_IWMI_WDT
+	tristate "AAEON Watchdog Timer"
+	depends on ASUS_WMI
+	depends on UBUNTU_ODM_DRIVERS
+	select MFD_AAEON
+	help
+	  This is the driver for the hardware watchdog on Single Board
+	  Computers produced by AAEON.Say `Y' here to support its built-in
+	  watchdog timer feature.
+
+	  This driver leverages the ASUS WMI interface to access device
+	  resources.
+
 # M68K Architecture
 
 config M54xx_WATCHDOG
@@ -1652,7 +1665,7 @@ config WDT_MTX1
 
 config SIBYTE_WDOG
 	tristate "Sibyte SoC hardware watchdog"
-	depends on CPU_SB1 || (MIPS && COMPILE_TEST)
+	depends on CPU_SB1
 	help
 	  Watchdog driver for the built in watchdog hardware in Sibyte
 	  SoC processors.  There are apparently two watchdog timers
@@ -1665,7 +1678,7 @@ config SIBYTE_WDOG
 
 config AR7_WDT
 	tristate "TI AR7 Watchdog Timer"
-	depends on AR7 || (MIPS && COMPILE_TEST)
+	depends on AR7 || (MIPS && 32BIT && COMPILE_TEST)
 	help
 	  Hardware driver for the TI AR7 Watchdog Timer.
 

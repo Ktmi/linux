@@ -25,8 +25,6 @@
 #include "hnae3.h"
 
 #define HCLGE_NAME			"hclge"
-#define HCLGE_STATS_READ(p, offset) (*(u64 *)((u8 *)(p) + (offset)))
-#define HCLGE_MAC_STATS_FIELD_OFF(f) (offsetof(struct hclge_mac_stats, f))
 
 #define HCLGE_BUF_SIZE_UNIT	256U
 #define HCLGE_BUF_MUL_BY	2
@@ -547,7 +545,7 @@ static int hclge_mac_query_reg_num(struct hclge_dev *hdev, u32 *desc_num)
 	return 0;
 }
 
-static int hclge_mac_update_stats(struct hclge_dev *hdev)
+int hclge_mac_update_stats(struct hclge_dev *hdev)
 {
 	u32 desc_num;
 	int ret;
@@ -1513,9 +1511,10 @@ static void hclge_init_kdump_kernel_config(struct hclge_dev *hdev)
 
 static int hclge_configure(struct hclge_dev *hdev)
 {
+	const struct cpumask *cpumask = cpu_online_mask;
 	struct hclge_cfg cfg;
 	unsigned int i;
-	int ret;
+	int node, ret;
 
 	ret = hclge_get_cfg(hdev, &cfg);
 	if (ret)
@@ -1576,11 +1575,12 @@ static int hclge_configure(struct hclge_dev *hdev)
 
 	hclge_init_kdump_kernel_config(hdev);
 
-	/* Set the init affinity based on pci func number */
-	i = cpumask_weight(cpumask_of_node(dev_to_node(&hdev->pdev->dev)));
-	i = i ? PCI_FUNC(hdev->pdev->devfn) % i : 0;
-	cpumask_set_cpu(cpumask_local_spread(i, dev_to_node(&hdev->pdev->dev)),
-			&hdev->affinity_mask);
+	/* Set the affinity based on numa node */
+	node = dev_to_node(&hdev->pdev->dev);
+	if (node != NUMA_NO_NODE)
+		cpumask = cpumask_of_node(node);
+
+	cpumask_copy(&hdev->affinity_mask, cpumask);
 
 	return ret;
 }
@@ -2474,7 +2474,7 @@ static int hclge_init_roce_base_info(struct hclge_vport *vport)
 	if (hdev->num_msi < hdev->num_nic_msi + hdev->num_roce_msi)
 		return -EINVAL;
 
-	roce->rinfo.base_vector = hdev->roce_base_vector;
+	roce->rinfo.base_vector = hdev->num_nic_msi;
 
 	roce->rinfo.netdev = nic->kinfo.netdev;
 	roce->rinfo.roce_io_base = hdev->hw.io_base;
@@ -2509,10 +2509,6 @@ static int hclge_init_msi(struct hclge_dev *hdev)
 
 	hdev->num_msi = vectors;
 	hdev->num_msi_left = vectors;
-
-	hdev->base_msi_vector = pdev->irq;
-	hdev->roce_base_vector = hdev->base_msi_vector +
-				hdev->num_nic_msi;
 
 	hdev->vector_status = devm_kcalloc(&pdev->dev, hdev->num_msi,
 					   sizeof(u16), GFP_KERNEL);
@@ -2830,6 +2826,7 @@ static void hclge_mbx_task_schedule(struct hclge_dev *hdev)
 static void hclge_reset_task_schedule(struct hclge_dev *hdev)
 {
 	if (!test_bit(HCLGE_STATE_REMOVING, &hdev->state) &&
+	    test_bit(HCLGE_STATE_SERVICE_INITED, &hdev->state) &&
 	    !test_and_set_bit(HCLGE_STATE_RST_SERVICE_SCHED, &hdev->state))
 		mod_delayed_work_on(cpumask_first(&hdev->affinity_mask),
 				    hclge_wq, &hdev->service_task, 0);
@@ -2924,12 +2921,12 @@ static void hclge_update_link_status(struct hclge_dev *hdev)
 	}
 
 	if (state != hdev->hw.mac.link) {
+		hdev->hw.mac.link = state;
 		client->ops->link_status_change(handle, state);
 		hclge_config_mac_tnl_int(hdev, state);
 		if (rclient && rclient->ops->link_status_change)
 			rclient->ops->link_status_change(rhandle, state);
 
-		hdev->hw.mac.link = state;
 		hclge_push_link_status(hdev);
 	}
 
@@ -3630,7 +3627,8 @@ static int hclge_set_all_vf_rst(struct hclge_dev *hdev, bool reset)
 		if (ret) {
 			dev_err(&hdev->pdev->dev,
 				"set vf(%u) rst failed %d!\n",
-				vport->vport_id, ret);
+				vport->vport_id - HCLGE_VF_VPORT_START_NUM,
+				ret);
 			return ret;
 		}
 
@@ -3645,7 +3643,8 @@ static int hclge_set_all_vf_rst(struct hclge_dev *hdev, bool reset)
 		if (ret)
 			dev_warn(&hdev->pdev->dev,
 				 "inform reset to vf(%u) failed %d!\n",
-				 vport->vport_id, ret);
+				 vport->vport_id - HCLGE_VF_VPORT_START_NUM,
+				 ret);
 	}
 
 	return 0;
@@ -4625,6 +4624,24 @@ static int hclge_get_rss(struct hnae3_handle *handle, u32 *indir,
 	return 0;
 }
 
+static int hclge_parse_rss_hfunc(struct hclge_vport *vport, const u8 hfunc,
+				 u8 *hash_algo)
+{
+	switch (hfunc) {
+	case ETH_RSS_HASH_TOP:
+		*hash_algo = HCLGE_RSS_HASH_ALGO_TOEPLITZ;
+		return 0;
+	case ETH_RSS_HASH_XOR:
+		*hash_algo = HCLGE_RSS_HASH_ALGO_SIMPLE;
+		return 0;
+	case ETH_RSS_HASH_NO_CHANGE:
+		*hash_algo = vport->rss_algo;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
 static int hclge_set_rss(struct hnae3_handle *handle, const u32 *indir,
 			 const  u8 *key, const  u8 hfunc)
 {
@@ -4634,30 +4651,27 @@ static int hclge_set_rss(struct hnae3_handle *handle, const u32 *indir,
 	u8 hash_algo;
 	int ret, i;
 
+	ret = hclge_parse_rss_hfunc(vport, hfunc, &hash_algo);
+	if (ret) {
+		dev_err(&hdev->pdev->dev, "invalid hfunc type %u\n", hfunc);
+		return ret;
+	}
+
 	/* Set the RSS Hash Key if specififed by the user */
 	if (key) {
-		switch (hfunc) {
-		case ETH_RSS_HASH_TOP:
-			hash_algo = HCLGE_RSS_HASH_ALGO_TOEPLITZ;
-			break;
-		case ETH_RSS_HASH_XOR:
-			hash_algo = HCLGE_RSS_HASH_ALGO_SIMPLE;
-			break;
-		case ETH_RSS_HASH_NO_CHANGE:
-			hash_algo = vport->rss_algo;
-			break;
-		default:
-			return -EINVAL;
-		}
-
 		ret = hclge_set_rss_algo_key(hdev, hash_algo, key);
 		if (ret)
 			return ret;
 
 		/* Update the shadow RSS key with user specified qids */
 		memcpy(vport->rss_hash_key, key, HCLGE_RSS_KEY_SIZE);
-		vport->rss_algo = hash_algo;
+	} else {
+		ret = hclge_set_rss_algo_key(hdev, hash_algo,
+					     vport->rss_hash_key);
+		if (ret)
+			return ret;
 	}
+	vport->rss_algo = hash_algo;
 
 	/* Update the shadow RSS table with user specified qids */
 	for (i = 0; i < ae_dev->dev_specs.rss_ind_tbl_size; i++)
@@ -6506,10 +6520,13 @@ static int hclge_fd_parse_ring_cookie(struct hclge_dev *hdev, u64 ring_cookie,
 		u8 vf = ethtool_get_flow_spec_ring_vf(ring_cookie);
 		u16 tqps;
 
+		/* To keep consistent with user's configuration, minus 1 when
+		 * printing 'vf', because vf id from ethtool is added 1 for vf.
+		 */
 		if (vf > hdev->num_req_vfs) {
 			dev_err(&hdev->pdev->dev,
-				"Error: vf id (%u) > max vf num (%u)\n",
-				vf, hdev->num_req_vfs);
+				"Error: vf id (%u) should be less than %u\n",
+				vf - 1, hdev->num_req_vfs);
 			return -EINVAL;
 		}
 
@@ -8006,11 +8023,12 @@ static void hclge_ae_stop(struct hnae3_handle *handle)
 	hclge_clear_arfs_rules(hdev);
 	spin_unlock_bh(&hdev->fd_rule_lock);
 
-	/* If it is not PF reset, the firmware will disable the MAC,
+	/* If it is not PF reset or FLR, the firmware will disable the MAC,
 	 * so it only need to stop phy here.
 	 */
 	if (test_bit(HCLGE_STATE_RST_HANDLING, &hdev->state) &&
-	    hdev->reset_type != HNAE3_FUNC_RESET) {
+	    hdev->reset_type != HNAE3_FUNC_RESET &&
+	    hdev->reset_type != HNAE3_FLR_RESET) {
 		hclge_mac_stop_phy(hdev);
 		hclge_update_link_status(hdev);
 		return;
@@ -8565,15 +8583,8 @@ int hclge_add_uc_addr_common(struct hclge_vport *vport,
 	}
 
 	/* check if we just hit the duplicate */
-	if (!ret) {
-		dev_warn(&hdev->pdev->dev, "VF %u mac(%pM) exists\n",
-			 vport->vport_id, addr);
-		return 0;
-	}
-
-	dev_err(&hdev->pdev->dev,
-		"PF failed to add unicast entry(%pM) in the MAC table\n",
-		addr);
+	if (!ret)
+		return -EEXIST;
 
 	return ret;
 }
@@ -8725,7 +8736,13 @@ static void hclge_sync_vport_mac_list(struct hclge_vport *vport,
 		} else {
 			set_bit(HCLGE_VPORT_STATE_MAC_TBL_CHANGE,
 				&vport->state);
-			break;
+
+			/* If one unicast mac address is existing in hardware,
+			 * we need to try whether other unicast mac addresses
+			 * are new addresses that can be added.
+			 */
+			if (ret != -EEXIST)
+				break;
 		}
 	}
 }
@@ -9584,6 +9601,9 @@ static int hclge_set_vlan_filter_hw(struct hclge_dev *hdev, __be16 proto,
 	if (is_kill && !vlan_id)
 		return 0;
 
+	if (vlan_id >= VLAN_N_VID)
+		return -EINVAL;
+
 	ret = hclge_set_vf_vlan_common(hdev, vport_id, is_kill, vlan_id);
 	if (ret) {
 		dev_err(&hdev->pdev->dev,
@@ -9869,7 +9889,11 @@ static int hclge_init_vlan_config(struct hclge_dev *hdev)
 static void hclge_add_vport_vlan_table(struct hclge_vport *vport, u16 vlan_id,
 				       bool writen_to_tbl)
 {
-	struct hclge_vport_vlan_cfg *vlan;
+	struct hclge_vport_vlan_cfg *vlan, *tmp;
+
+	list_for_each_entry_safe(vlan, tmp, &vport->vlan_list, node)
+		if (vlan->vlan_id == vlan_id)
+			return;
 
 	vlan = kzalloc(sizeof(*vlan), GFP_KERNEL);
 	if (!vlan)
@@ -10414,7 +10438,8 @@ static int hclge_reset_tqp_cmd_send(struct hclge_dev *hdev, u16 queue_id,
 	return 0;
 }
 
-static int hclge_get_reset_status(struct hclge_dev *hdev, u16 queue_id)
+static int hclge_get_reset_status(struct hclge_dev *hdev, u16 queue_id,
+				  u8 *reset_status)
 {
 	struct hclge_reset_tqp_queue_cmd *req;
 	struct hclge_desc desc;
@@ -10432,7 +10457,9 @@ static int hclge_get_reset_status(struct hclge_dev *hdev, u16 queue_id)
 		return ret;
 	}
 
-	return hnae3_get_bit(req->ready_to_reset, HCLGE_TQP_RESET_B);
+	*reset_status = hnae3_get_bit(req->ready_to_reset, HCLGE_TQP_RESET_B);
+
+	return 0;
 }
 
 u16 hclge_covert_handle_qid_global(struct hnae3_handle *handle, u16 queue_id)
@@ -10451,7 +10478,7 @@ static int hclge_reset_tqp_cmd(struct hnae3_handle *handle)
 	struct hclge_vport *vport = hclge_get_vport(handle);
 	struct hclge_dev *hdev = vport->back;
 	u16 reset_try_times = 0;
-	int reset_status;
+	u8 reset_status;
 	u16 queue_gid;
 	int ret;
 	u16 i;
@@ -10467,7 +10494,11 @@ static int hclge_reset_tqp_cmd(struct hnae3_handle *handle)
 		}
 
 		while (reset_try_times++ < HCLGE_TQP_RESET_TRY_TIMES) {
-			reset_status = hclge_get_reset_status(hdev, queue_gid);
+			ret = hclge_get_reset_status(hdev, queue_gid,
+						     &reset_status);
+			if (ret)
+				return ret;
+
 			if (reset_status)
 				break;
 
@@ -10701,6 +10732,35 @@ static int hclge_set_pauseparam(struct hnae3_handle *handle, u32 auto_neg,
 		return phy_start_aneg(phydev);
 
 	return -EOPNOTSUPP;
+}
+
+static int hclge_restore_pauseparam(struct hnae3_handle *handle)
+{
+	struct hclge_vport *vport = hclge_get_vport(handle);
+	struct hclge_dev *hdev = vport->back;
+	u32 auto_neg, rx_pause, tx_pause;
+	int ret;
+
+	hclge_get_pauseparam(handle, &auto_neg, &rx_pause, &tx_pause);
+	/* when autoneg is disabled, the pause setting of phy has no effect
+	 * unless the link goes down.
+	 */
+	ret = phy_suspend(hdev->hw.mac.phydev);
+	if (ret)
+		return ret;
+
+	phy_set_asym_pause(hdev->hw.mac.phydev, rx_pause, tx_pause);
+
+	ret = phy_resume(hdev->hw.mac.phydev);
+	if (ret)
+		return ret;
+
+	ret = hclge_mac_pause_setup_hw(hdev);
+	if (ret)
+		dev_err(&hdev->pdev->dev,
+			"restore pauseparam error, ret = %d.\n", ret);
+
+	return ret;
 }
 
 static void hclge_get_ksettings_an_result(struct hnae3_handle *handle,
@@ -11158,13 +11218,35 @@ static void hclge_clear_resetting_state(struct hclge_dev *hdev)
 		struct hclge_vport *vport = &hdev->vport[i];
 		int ret;
 
-		 /* Send cmd to clear VF's FUNC_RST_ING */
+		 /* Send cmd to clear vport's FUNC_RST_ING */
 		ret = hclge_set_vf_rst(hdev, vport->vport_id, false);
 		if (ret)
 			dev_warn(&hdev->pdev->dev,
-				 "clear vf(%u) rst failed %d!\n",
+				 "clear vport(%u) rst failed %d!\n",
 				 vport->vport_id, ret);
 	}
+}
+
+static int hclge_clear_hw_resource(struct hclge_dev *hdev)
+{
+	struct hclge_desc desc;
+	int ret;
+
+	hclge_cmd_setup_basic_desc(&desc, HCLGE_OPC_CLEAR_HW_RESOURCE, false);
+
+	ret = hclge_cmd_send(&hdev->hw, &desc, 1);
+	/* This new command is only supported by new firmware, it will
+	 * fail with older firmware. Error value -EOPNOSUPP can only be
+	 * returned by older firmware running this command, to keep code
+	 * backward compatible we will override this value and return
+	 * success.
+	 */
+	if (ret && ret != -EOPNOTSUPP) {
+		dev_err(&hdev->pdev->dev,
+			"failed to clear hw resource, ret = %d\n", ret);
+		return ret;
+	}
+	return 0;
 }
 
 static int hclge_init_ae_dev(struct hnae3_ae_dev *ae_dev)
@@ -11201,6 +11283,10 @@ static int hclge_init_ae_dev(struct hnae3_ae_dev *ae_dev)
 
 	/* Firmware command initialize */
 	ret = hclge_cmd_init(hdev);
+	if (ret)
+		goto err_cmd_uninit;
+
+	ret  = hclge_clear_hw_resource(hdev);
 	if (ret)
 		goto err_cmd_uninit;
 
@@ -12548,6 +12634,7 @@ static const struct hnae3_ae_ops hclge_ops = {
 	.halt_autoneg = hclge_halt_autoneg,
 	.get_pauseparam = hclge_get_pauseparam,
 	.set_pauseparam = hclge_set_pauseparam,
+	.restore_pauseparam = hclge_restore_pauseparam,
 	.set_mtu = hclge_set_mtu,
 	.reset_queue = hclge_reset_tqp,
 	.get_stats = hclge_get_stats,
@@ -12626,6 +12713,7 @@ static int hclge_init(void)
 
 static void hclge_exit(void)
 {
+	hnae3_unregister_ae_algo_prepare(&ae_algo);
 	hnae3_unregister_ae_algo(&ae_algo);
 	destroy_workqueue(hclge_wq);
 }

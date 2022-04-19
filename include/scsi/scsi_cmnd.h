@@ -68,7 +68,7 @@ struct scsi_pointer {
 struct scsi_cmnd {
 	struct scsi_request req;
 	struct scsi_device *device;
-	struct list_head eh_entry; /* entry for the host eh_cmd_q */
+	struct list_head eh_entry; /* entry for the host eh_abort_list/eh_cmd_q */
 	struct delayed_work abort_work;
 
 	struct rcu_head rcu;
@@ -340,5 +340,8 @@ static inline unsigned scsi_transfer_length(struct scsi_cmnd *scmd)
 
 	return xfer_len;
 }
+
+extern void scsi_build_sense(struct scsi_cmnd *scmd, int desc,
+			     u8 key, u8 asc, u8 ascq);
 
 #endif /* _SCSI_SCSI_CMND_H */

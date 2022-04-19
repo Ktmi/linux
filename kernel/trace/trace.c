@@ -250,6 +250,10 @@ __setup("trace_clock=", set_trace_boot_clock);
 
 static int __init set_tracepoint_printk(char *str)
 {
+	/* Ignore the "tp_printk_stop_on_boot" param */
+	if (*str == '_')
+		return 0;
+
 	if ((strcmp(str, "=0") != 0 && strcmp(str, "=off") != 0))
 		tracepoint_printk = 1;
 	return 1;
@@ -1706,7 +1710,8 @@ static void trace_create_maxlat_file(struct trace_array *tr,
 {
 	INIT_WORK(&tr->fsnotify_work, latency_fsnotify_workfn);
 	init_irq_work(&tr->fsnotify_irqwork, latency_fsnotify_workfn_irq);
-	tr->d_max_latency = trace_create_file("tracing_max_latency", 0644,
+	tr->d_max_latency = trace_create_file("tracing_max_latency",
+					      TRACE_MODE_WRITE,
 					      d_tracer, &tr->max_latency,
 					      &tracing_max_lat_fops);
 }
@@ -1743,8 +1748,8 @@ void latency_fsnotify(struct trace_array *tr)
 #else
 
 #define trace_create_maxlat_file(tr, d_tracer)				\
-	trace_create_file("tracing_max_latency", 0644, d_tracer,	\
-			  &tr->max_latency, &tracing_max_lat_fops)
+	trace_create_file("tracing_max_latency", TRACE_MODE_WRITE,	\
+			  d_tracer, &tr->max_latency, &tracing_max_lat_fops)
 
 #endif
 
@@ -2184,7 +2189,14 @@ void tracing_reset_all_online_cpus(void)
 	}
 }
 
+/*
+ * The tgid_map array maps from pid to tgid; i.e. the value stored at index i
+ * is the tgid last observed corresponding to pid=i.
+ */
 static int *tgid_map;
+
+/* The maximum valid index into tgid_map. */
+static size_t tgid_map_max;
 
 #define SAVED_CMDLINES_DEFAULT 128
 #define NO_CMDLINE_MAP UINT_MAX
@@ -2458,24 +2470,41 @@ void trace_find_cmdline(int pid, char comm[])
 	preempt_enable();
 }
 
+static int *trace_find_tgid_ptr(int pid)
+{
+	/*
+	 * Pairs with the smp_store_release in set_tracer_flag() to ensure that
+	 * if we observe a non-NULL tgid_map then we also observe the correct
+	 * tgid_map_max.
+	 */
+	int *map = smp_load_acquire(&tgid_map);
+
+	if (unlikely(!map || pid > tgid_map_max))
+		return NULL;
+
+	return &map[pid];
+}
+
 int trace_find_tgid(int pid)
 {
-	if (unlikely(!tgid_map || !pid || pid > PID_MAX_DEFAULT))
-		return 0;
+	int *ptr = trace_find_tgid_ptr(pid);
 
-	return tgid_map[pid];
+	return ptr ? *ptr : 0;
 }
 
 static int trace_save_tgid(struct task_struct *tsk)
 {
+	int *ptr;
+
 	/* treat recording of idle task as a success */
 	if (!tsk->pid)
 		return 1;
 
-	if (unlikely(!tgid_map || tsk->pid > PID_MAX_DEFAULT))
+	ptr = trace_find_tgid_ptr(tsk->pid);
+	if (!ptr)
 		return 0;
 
-	tgid_map[tsk->pid] = tsk->tgid;
+	*ptr = tsk->tgid;
 	return 1;
 }
 
@@ -2829,14 +2858,26 @@ int tracepoint_printk_sysctl(struct ctl_table *table, int write,
 
 void trace_event_buffer_commit(struct trace_event_buffer *fbuffer)
 {
+	enum event_trigger_type tt = ETT_NONE;
+	struct trace_event_file *file = fbuffer->trace_file;
+
+	if (__event_trigger_test_discard(file, fbuffer->buffer, fbuffer->event,
+			fbuffer->entry, &tt))
+		goto discard;
+
 	if (static_key_false(&tracepoint_printk_key.key))
 		output_printk(fbuffer);
 
 	if (static_branch_unlikely(&trace_event_exports_enabled))
 		ftrace_exports(fbuffer->event, TRACE_EXPORT_EVENT);
-	event_trigger_unlock_commit_regs(fbuffer->trace_file, fbuffer->buffer,
-				    fbuffer->event, fbuffer->entry,
-				    fbuffer->trace_ctx, fbuffer->regs);
+
+	trace_buffer_unlock_commit_regs(file->tr, fbuffer->buffer,
+			fbuffer->event, fbuffer->trace_ctx, fbuffer->regs);
+
+discard:
+	if (tt)
+		event_triggers_post_call(file, tt);
+
 }
 EXPORT_SYMBOL_GPL(trace_event_buffer_commit);
 
@@ -3141,7 +3182,7 @@ struct trace_buffer_struct {
 	char buffer[4][TRACE_BUF_SIZE];
 };
 
-static struct trace_buffer_struct *trace_percpu_buffer;
+static struct trace_buffer_struct __percpu *trace_percpu_buffer;
 
 /*
  * This allows for lockless recording.  If we're nested too deeply, then
@@ -3151,7 +3192,7 @@ static char *get_trace_buf(void)
 {
 	struct trace_buffer_struct *buffer = this_cpu_ptr(trace_percpu_buffer);
 
-	if (!buffer || buffer->nesting >= 4)
+	if (!trace_percpu_buffer || buffer->nesting >= 4)
 		return NULL;
 
 	buffer->nesting++;
@@ -3170,7 +3211,7 @@ static void put_trace_buf(void)
 
 static int alloc_percpu_trace_buffer(void)
 {
-	struct trace_buffer_struct *buffers;
+	struct trace_buffer_struct __percpu *buffers;
 
 	if (trace_percpu_buffer)
 		return 0;
@@ -3745,6 +3786,18 @@ void trace_check_vprintf(struct trace_iterator *iter, const char *fmt,
 		strncpy(iter->fmt, p, i);
 		iter->fmt[i] = '\0';
 		trace_seq_vprintf(&iter->seq, iter->fmt, ap);
+
+		/*
+		 * If iter->seq is full, the above call no longer guarantees
+		 * that ap is in sync with fmt processing, and further calls
+		 * to va_arg() can return wrong positional arguments.
+		 *
+		 * Ensure that ap is no longer used in this case.
+		 */
+		if (iter->seq.full) {
+			p = "";
+			break;
+		}
 
 		if (star)
 			len = va_arg(ap, int);
@@ -5171,6 +5224,8 @@ int trace_keep_overwrite(struct tracer *tracer, u32 mask, int set)
 
 int set_tracer_flag(struct trace_array *tr, unsigned int mask, int enabled)
 {
+	int *map;
+
 	if ((mask == TRACE_ITER_RECORD_TGID) ||
 	    (mask == TRACE_ITER_RECORD_CMD))
 		lockdep_assert_held(&event_mutex);
@@ -5193,10 +5248,19 @@ int set_tracer_flag(struct trace_array *tr, unsigned int mask, int enabled)
 		trace_event_enable_cmd_record(enabled);
 
 	if (mask == TRACE_ITER_RECORD_TGID) {
-		if (!tgid_map)
-			tgid_map = kvcalloc(PID_MAX_DEFAULT + 1,
-					   sizeof(*tgid_map),
-					   GFP_KERNEL);
+		if (!tgid_map) {
+			tgid_map_max = pid_max;
+			map = kvcalloc(tgid_map_max + 1, sizeof(*tgid_map),
+				       GFP_KERNEL);
+
+			/*
+			 * Pairs with smp_load_acquire() in
+			 * trace_find_tgid_ptr() to ensure that if it observes
+			 * the tgid_map we just allocated then it also observes
+			 * the corresponding tgid_map_max value.
+			 */
+			smp_store_release(&tgid_map, map);
+		}
 		if (!tgid_map) {
 			tr->trace_flags &= ~TRACE_ITER_RECORD_TGID;
 			return -ENOMEM;
@@ -5530,6 +5594,10 @@ static const char readme_msg[] =
 	"\t            [:name=histname1]\n"
 	"\t            [:<handler>.<action>]\n"
 	"\t            [if <filter>]\n\n"
+	"\t    Note, special fields can be used as well:\n"
+	"\t            common_timestamp - to record current timestamp\n"
+	"\t            common_cpu - to record the CPU the event happened on\n"
+	"\n"
 	"\t    When a matching event is hit, an entry is added to a hash\n"
 	"\t    table using the key(s) and value(s) named, and the value of a\n"
 	"\t    sum called 'hitcount' is incremented.  Keys and values\n"
@@ -5608,37 +5676,16 @@ static const struct file_operations tracing_readme_fops = {
 
 static void *saved_tgids_next(struct seq_file *m, void *v, loff_t *pos)
 {
-	int *ptr = v;
+	int pid = ++(*pos);
 
-	if (*pos || m->count)
-		ptr++;
-
-	(*pos)++;
-
-	for (; ptr <= &tgid_map[PID_MAX_DEFAULT]; ptr++) {
-		if (trace_find_tgid(*ptr))
-			return ptr;
-	}
-
-	return NULL;
+	return trace_find_tgid_ptr(pid);
 }
 
 static void *saved_tgids_start(struct seq_file *m, loff_t *pos)
 {
-	void *v;
-	loff_t l = 0;
+	int pid = *pos;
 
-	if (!tgid_map)
-		return NULL;
-
-	v = &tgid_map[0];
-	while (l <= *pos) {
-		v = saved_tgids_next(m, v, &l);
-		if (!v)
-			return NULL;
-	}
-
-	return v;
+	return trace_find_tgid_ptr(pid);
 }
 
 static void saved_tgids_stop(struct seq_file *m, void *v)
@@ -5647,9 +5694,14 @@ static void saved_tgids_stop(struct seq_file *m, void *v)
 
 static int saved_tgids_show(struct seq_file *m, void *v)
 {
-	int pid = (int *)v - tgid_map;
+	int *entry = (int *)v;
+	int pid = entry - tgid_map;
+	int tgid = *entry;
 
-	seq_printf(m, "%d %d\n", pid, trace_find_tgid(pid));
+	if (tgid == 0)
+		return SEQ_SKIP;
+
+	seq_printf(m, "%d %d\n", pid, tgid);
 	return 0;
 }
 
@@ -5983,7 +6035,7 @@ trace_insert_eval_map_file(struct module *mod, struct trace_eval_map **start,
 
 static void trace_create_eval_file(struct dentry *d_tracer)
 {
-	trace_create_file("eval_map", 0444, d_tracer,
+	trace_create_file("eval_map", TRACE_MODE_READ, d_tracer,
 			  NULL, &tracing_eval_map_fops);
 }
 
@@ -7557,7 +7609,8 @@ static struct tracing_log_err *get_tracing_log_err(struct trace_array *tr)
 		err = kzalloc(sizeof(*err), GFP_KERNEL);
 		if (!err)
 			err = ERR_PTR(-ENOMEM);
-		tr->n_err_log_entries++;
+		else
+			tr->n_err_log_entries++;
 
 		return err;
 	}
@@ -8411,27 +8464,27 @@ tracing_init_tracefs_percpu(struct trace_array *tr, long cpu)
 	}
 
 	/* per cpu trace_pipe */
-	trace_create_cpu_file("trace_pipe", 0444, d_cpu,
+	trace_create_cpu_file("trace_pipe", TRACE_MODE_READ, d_cpu,
 				tr, cpu, &tracing_pipe_fops);
 
 	/* per cpu trace */
-	trace_create_cpu_file("trace", 0644, d_cpu,
+	trace_create_cpu_file("trace", TRACE_MODE_WRITE, d_cpu,
 				tr, cpu, &tracing_fops);
 
-	trace_create_cpu_file("trace_pipe_raw", 0444, d_cpu,
+	trace_create_cpu_file("trace_pipe_raw", TRACE_MODE_READ, d_cpu,
 				tr, cpu, &tracing_buffers_fops);
 
-	trace_create_cpu_file("stats", 0444, d_cpu,
+	trace_create_cpu_file("stats", TRACE_MODE_READ, d_cpu,
 				tr, cpu, &tracing_stats_fops);
 
-	trace_create_cpu_file("buffer_size_kb", 0444, d_cpu,
+	trace_create_cpu_file("buffer_size_kb", TRACE_MODE_READ, d_cpu,
 				tr, cpu, &tracing_entries_fops);
 
 #ifdef CONFIG_TRACER_SNAPSHOT
-	trace_create_cpu_file("snapshot", 0644, d_cpu,
+	trace_create_cpu_file("snapshot", TRACE_MODE_WRITE, d_cpu,
 				tr, cpu, &snapshot_fops);
 
-	trace_create_cpu_file("snapshot_raw", 0444, d_cpu,
+	trace_create_cpu_file("snapshot_raw", TRACE_MODE_READ, d_cpu,
 				tr, cpu, &snapshot_raw_fops);
 #endif
 }
@@ -8637,8 +8690,8 @@ create_trace_option_file(struct trace_array *tr,
 	topt->opt = opt;
 	topt->tr = tr;
 
-	topt->entry = trace_create_file(opt->name, 0644, t_options, topt,
-				    &trace_options_fops);
+	topt->entry = trace_create_file(opt->name, TRACE_MODE_WRITE,
+					t_options, topt, &trace_options_fops);
 
 }
 
@@ -8713,7 +8766,7 @@ create_trace_option_core_file(struct trace_array *tr,
 	if (!t_options)
 		return NULL;
 
-	return trace_create_file(option, 0644, t_options,
+	return trace_create_file(option, TRACE_MODE_WRITE, t_options,
 				 (void *)&tr->trace_flags_index[index],
 				 &trace_options_core_fops);
 }
@@ -8983,8 +9036,10 @@ static int trace_array_create_dir(struct trace_array *tr)
 		return -EINVAL;
 
 	ret = event_trace_add_tracer(tr->dir, tr);
-	if (ret)
+	if (ret) {
 		tracefs_remove(tr->dir);
+		return ret;
+	}
 
 	init_tracer_tracefs(tr, tr->dir);
 	__update_tracer_options(tr);
@@ -9236,28 +9291,28 @@ init_tracer_tracefs(struct trace_array *tr, struct dentry *d_tracer)
 	struct trace_event_file *file;
 	int cpu;
 
-	trace_create_file("available_tracers", 0444, d_tracer,
+	trace_create_file("available_tracers", TRACE_MODE_READ, d_tracer,
 			tr, &show_traces_fops);
 
-	trace_create_file("current_tracer", 0644, d_tracer,
+	trace_create_file("current_tracer", TRACE_MODE_WRITE, d_tracer,
 			tr, &set_tracer_fops);
 
-	trace_create_file("tracing_cpumask", 0644, d_tracer,
+	trace_create_file("tracing_cpumask", TRACE_MODE_WRITE, d_tracer,
 			  tr, &tracing_cpumask_fops);
 
-	trace_create_file("trace_options", 0644, d_tracer,
+	trace_create_file("trace_options", TRACE_MODE_WRITE, d_tracer,
 			  tr, &tracing_iter_fops);
 
-	trace_create_file("trace", 0644, d_tracer,
+	trace_create_file("trace", TRACE_MODE_WRITE, d_tracer,
 			  tr, &tracing_fops);
 
-	trace_create_file("trace_pipe", 0444, d_tracer,
+	trace_create_file("trace_pipe", TRACE_MODE_READ, d_tracer,
 			  tr, &tracing_pipe_fops);
 
-	trace_create_file("buffer_size_kb", 0644, d_tracer,
+	trace_create_file("buffer_size_kb", TRACE_MODE_WRITE, d_tracer,
 			  tr, &tracing_entries_fops);
 
-	trace_create_file("buffer_total_size_kb", 0444, d_tracer,
+	trace_create_file("buffer_total_size_kb", TRACE_MODE_READ, d_tracer,
 			  tr, &tracing_total_entries_fops);
 
 	trace_create_file("free_buffer", 0200, d_tracer,
@@ -9268,25 +9323,25 @@ init_tracer_tracefs(struct trace_array *tr, struct dentry *d_tracer)
 
 	file = __find_event_file(tr, "ftrace", "print");
 	if (file && file->dir)
-		trace_create_file("trigger", 0644, file->dir, file,
-				  &event_trigger_fops);
+		trace_create_file("trigger", TRACE_MODE_WRITE, file->dir,
+				  file, &event_trigger_fops);
 	tr->trace_marker_file = file;
 
 	trace_create_file("trace_marker_raw", 0220, d_tracer,
 			  tr, &tracing_mark_raw_fops);
 
-	trace_create_file("trace_clock", 0644, d_tracer, tr,
+	trace_create_file("trace_clock", TRACE_MODE_WRITE, d_tracer, tr,
 			  &trace_clock_fops);
 
-	trace_create_file("tracing_on", 0644, d_tracer,
+	trace_create_file("tracing_on", TRACE_MODE_WRITE, d_tracer,
 			  tr, &rb_simple_fops);
 
-	trace_create_file("timestamp_mode", 0444, d_tracer, tr,
+	trace_create_file("timestamp_mode", TRACE_MODE_READ, d_tracer, tr,
 			  &trace_time_stamp_mode_fops);
 
 	tr->buffer_percent = 50;
 
-	trace_create_file("buffer_percent", 0444, d_tracer,
+	trace_create_file("buffer_percent", TRACE_MODE_READ, d_tracer,
 			tr, &buffer_percent_fops);
 
 	create_trace_options_dir(tr);
@@ -9299,11 +9354,11 @@ init_tracer_tracefs(struct trace_array *tr, struct dentry *d_tracer)
 		MEM_FAIL(1, "Could not allocate function filter files");
 
 #ifdef CONFIG_TRACER_SNAPSHOT
-	trace_create_file("snapshot", 0644, d_tracer,
+	trace_create_file("snapshot", TRACE_MODE_WRITE, d_tracer,
 			  tr, &snapshot_fops);
 #endif
 
-	trace_create_file("error_log", 0644, d_tracer,
+	trace_create_file("error_log", TRACE_MODE_WRITE, d_tracer,
 			  tr, &tracing_err_log_fops);
 
 	for_each_tracing_cpu(cpu)
@@ -9496,19 +9551,19 @@ static __init int tracer_init_tracefs(void)
 	init_tracer_tracefs(&global_trace, NULL);
 	ftrace_init_tracefs_toplevel(&global_trace, NULL);
 
-	trace_create_file("tracing_thresh", 0644, NULL,
+	trace_create_file("tracing_thresh", TRACE_MODE_WRITE, NULL,
 			&global_trace, &tracing_thresh_fops);
 
-	trace_create_file("README", 0444, NULL,
+	trace_create_file("README", TRACE_MODE_READ, NULL,
 			NULL, &tracing_readme_fops);
 
-	trace_create_file("saved_cmdlines", 0444, NULL,
+	trace_create_file("saved_cmdlines", TRACE_MODE_READ, NULL,
 			NULL, &tracing_saved_cmdlines_fops);
 
-	trace_create_file("saved_cmdlines_size", 0644, NULL,
+	trace_create_file("saved_cmdlines_size", TRACE_MODE_WRITE, NULL,
 			  NULL, &tracing_saved_cmdlines_size_fops);
 
-	trace_create_file("saved_tgids", 0444, NULL,
+	trace_create_file("saved_tgids", TRACE_MODE_READ, NULL,
 			NULL, &tracing_saved_tgids_fops);
 
 	trace_eval_init();
@@ -9520,7 +9575,7 @@ static __init int tracer_init_tracefs(void)
 #endif
 
 #ifdef CONFIG_DYNAMIC_FTRACE
-	trace_create_file("dyn_ftrace_total_info", 0444, NULL,
+	trace_create_file("dyn_ftrace_total_info", TRACE_MODE_READ, NULL,
 			NULL, &tracing_dyn_info_fops);
 #endif
 

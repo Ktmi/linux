@@ -940,6 +940,14 @@ int btrfs_quota_enable(struct btrfs_fs_info *fs_info)
 	int ret = 0;
 	int slot;
 
+	/*
+	 * We need to have subvol_sem write locked, to prevent races between
+	 * concurrent tasks trying to enable quotas, because we will unlock
+	 * and relock qgroup_ioctl_lock before setting fs_info->quota_root
+	 * and before setting BTRFS_FS_QUOTA_ENABLED.
+	 */
+	lockdep_assert_held_write(&fs_info->subvol_sem);
+
 	mutex_lock(&fs_info->qgroup_ioctl_lock);
 	if (fs_info->quota_root)
 		goto out;
@@ -1117,8 +1125,19 @@ out_add_root:
 		goto out_free_path;
 	}
 
+	mutex_unlock(&fs_info->qgroup_ioctl_lock);
+	/*
+	 * Commit the transaction while not holding qgroup_ioctl_lock, to avoid
+	 * a deadlock with tasks concurrently doing other qgroup operations, such
+	 * adding/removing qgroups or adding/deleting qgroup relations for example,
+	 * because all qgroup operations first start or join a transaction and then
+	 * lock the qgroup_ioctl_lock mutex.
+	 * We are safe from a concurrent task trying to enable quotas, by calling
+	 * this function, since we are serialized by fs_info->subvol_sem.
+	 */
 	ret = btrfs_commit_transaction(trans);
 	trans = NULL;
+	mutex_lock(&fs_info->qgroup_ioctl_lock);
 	if (ret)
 		goto out_free_path;
 
@@ -1166,9 +1185,24 @@ int btrfs_quota_disable(struct btrfs_fs_info *fs_info)
 	struct btrfs_trans_handle *trans = NULL;
 	int ret = 0;
 
+	/*
+	 * We need to have subvol_sem write locked, to prevent races between
+	 * concurrent tasks trying to disable quotas, because we will unlock
+	 * and relock qgroup_ioctl_lock across BTRFS_FS_QUOTA_ENABLED changes.
+	 */
+	lockdep_assert_held_write(&fs_info->subvol_sem);
+
 	mutex_lock(&fs_info->qgroup_ioctl_lock);
 	if (!fs_info->quota_root)
 		goto out;
+
+	/*
+	 * Request qgroup rescan worker to complete and wait for it. This wait
+	 * must be done before transaction start for quota disable since it may
+	 * deadlock with transaction by the qgroup rescan worker.
+	 */
+	clear_bit(BTRFS_FS_QUOTA_ENABLED, &fs_info->flags);
+	btrfs_qgroup_wait_for_completion(fs_info, false);
 	mutex_unlock(&fs_info->qgroup_ioctl_lock);
 
 	/*
@@ -1186,14 +1220,13 @@ int btrfs_quota_disable(struct btrfs_fs_info *fs_info)
 	if (IS_ERR(trans)) {
 		ret = PTR_ERR(trans);
 		trans = NULL;
+		set_bit(BTRFS_FS_QUOTA_ENABLED, &fs_info->flags);
 		goto out;
 	}
 
 	if (!fs_info->quota_root)
 		goto out;
 
-	clear_bit(BTRFS_FS_QUOTA_ENABLED, &fs_info->flags);
-	btrfs_qgroup_wait_for_completion(fs_info, false);
 	spin_lock(&fs_info->qgroup_lock);
 	quota_root = fs_info->quota_root;
 	fs_info->quota_root = NULL;
@@ -1704,17 +1737,39 @@ int btrfs_qgroup_trace_extent_nolock(struct btrfs_fs_info *fs_info,
 	return 0;
 }
 
-int btrfs_qgroup_trace_extent_post(struct btrfs_fs_info *fs_info,
+int btrfs_qgroup_trace_extent_post(struct btrfs_trans_handle *trans,
 				   struct btrfs_qgroup_extent_record *qrecord)
 {
 	struct ulist *old_root;
 	u64 bytenr = qrecord->bytenr;
 	int ret;
 
-	ret = btrfs_find_all_roots(NULL, fs_info, bytenr, 0, &old_root, false);
+	/*
+	 * We are always called in a context where we are already holding a
+	 * transaction handle. Often we are called when adding a data delayed
+	 * reference from btrfs_truncate_inode_items() (truncating or unlinking),
+	 * in which case we will be holding a write lock on extent buffer from a
+	 * subvolume tree. In this case we can't allow btrfs_find_all_roots() to
+	 * acquire fs_info->commit_root_sem, because that is a higher level lock
+	 * that must be acquired before locking any extent buffers.
+	 *
+	 * So we want btrfs_find_all_roots() to not acquire the commit_root_sem
+	 * but we can't pass it a non-NULL transaction handle, because otherwise
+	 * it would not use commit roots and would lock extent buffers, causing
+	 * a deadlock if it ends up trying to read lock the same extent buffer
+	 * that was previously write locked at btrfs_truncate_inode_items().
+	 *
+	 * So pass a NULL transaction handle to btrfs_find_all_roots() and
+	 * explicitly tell it to not acquire the commit_root_sem - if we are
+	 * holding a transaction handle we don't need its protection.
+	 */
+	ASSERT(trans != NULL);
+
+	ret = btrfs_find_all_roots(NULL, trans->fs_info, bytenr, 0, &old_root,
+				   false, true);
 	if (ret < 0) {
-		fs_info->qgroup_flags |= BTRFS_QGROUP_STATUS_FLAG_INCONSISTENT;
-		btrfs_warn(fs_info,
+		trans->fs_info->qgroup_flags |= BTRFS_QGROUP_STATUS_FLAG_INCONSISTENT;
+		btrfs_warn(trans->fs_info,
 "error accounting new delayed refs extent (err code: %d), quota inconsistent",
 			ret);
 		return 0;
@@ -1758,7 +1813,7 @@ int btrfs_qgroup_trace_extent(struct btrfs_trans_handle *trans, u64 bytenr,
 		kfree(record);
 		return 0;
 	}
-	return btrfs_qgroup_trace_extent_post(fs_info, record);
+	return btrfs_qgroup_trace_extent_post(trans, record);
 }
 
 int btrfs_qgroup_trace_leaf_items(struct btrfs_trans_handle *trans,
@@ -2629,7 +2684,7 @@ int btrfs_qgroup_account_extents(struct btrfs_trans_handle *trans)
 				/* Search commit root to find old_roots */
 				ret = btrfs_find_all_roots(NULL, fs_info,
 						record->bytenr, 0,
-						&record->old_roots, false);
+						&record->old_roots, false, false);
 				if (ret < 0)
 					goto cleanup;
 			}
@@ -2645,7 +2700,7 @@ int btrfs_qgroup_account_extents(struct btrfs_trans_handle *trans)
 			 * current root. It's safe inside commit_transaction().
 			 */
 			ret = btrfs_find_all_roots(trans, fs_info,
-				record->bytenr, BTRFS_SEQ_LAST, &new_roots, false);
+			   record->bytenr, BTRFS_SEQ_LAST, &new_roots, false, false);
 			if (ret < 0)
 				goto cleanup;
 			if (qgroup_to_skip) {
@@ -3179,7 +3234,7 @@ static int qgroup_rescan_leaf(struct btrfs_trans_handle *trans,
 			num_bytes = found.offset;
 
 		ret = btrfs_find_all_roots(NULL, fs_info, found.objectid, 0,
-					   &roots, false);
+					   &roots, false, false);
 		if (ret < 0)
 			goto out;
 		/* For rescan, just pass old_roots as NULL */
@@ -3338,6 +3393,9 @@ qgroup_rescan_init(struct btrfs_fs_info *fs_info, u64 progress_objectid,
 			btrfs_warn(fs_info,
 			"qgroup rescan init failed, qgroup is not enabled");
 			ret = -EINVAL;
+		} else if (!test_bit(BTRFS_FS_QUOTA_ENABLED, &fs_info->flags)) {
+			/* Quota disable is in progress */
+			ret = -EBUSY;
 		}
 
 		if (ret) {

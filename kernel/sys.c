@@ -558,6 +558,10 @@ long __sys_setreuid(uid_t ruid, uid_t euid)
 	if (retval < 0)
 		goto error;
 
+	retval = set_cred_ucounts(new);
+	if (retval < 0)
+		goto error;
+
 	return commit_creds(new);
 
 error:
@@ -613,6 +617,10 @@ long __sys_setuid(uid_t uid)
 	new->fsuid = new->euid = kuid;
 
 	retval = security_task_fix_setuid(new, old, LSM_SETID_ID);
+	if (retval < 0)
+		goto error;
+
+	retval = set_cred_ucounts(new);
 	if (retval < 0)
 		goto error;
 
@@ -688,6 +696,10 @@ long __sys_setresuid(uid_t ruid, uid_t euid, uid_t suid)
 	new->fsuid = new->euid;
 
 	retval = security_task_fix_setuid(new, old, LSM_SETID_RES);
+	if (retval < 0)
+		goto error;
+
+	retval = set_cred_ucounts(new);
 	if (retval < 0)
 		goto error;
 
@@ -1214,6 +1226,21 @@ SYSCALL_DEFINE0(setsid)
 }
 
 DECLARE_RWSEM(uts_sem);
+
+#ifdef COMPAT_UTS_MACHINE
+static char compat_uts_machine[__OLD_UTS_LEN+1] = COMPAT_UTS_MACHINE;
+
+static int __init parse_compat_uts_machine(char *arg)
+{
+	strncpy(compat_uts_machine, arg, __OLD_UTS_LEN);
+	compat_uts_machine[__OLD_UTS_LEN] = 0;
+	return 0;
+}
+early_param("compat_uts_machine", parse_compat_uts_machine);
+
+#undef COMPAT_UTS_MACHINE
+#define COMPAT_UTS_MACHINE compat_uts_machine
+#endif
 
 #ifdef COMPAT_UTS_MACHINE
 #define override_architecture(name) \
@@ -1946,13 +1973,6 @@ static int validate_prctl_map_addr(struct prctl_mm_map *prctl_map)
 #undef __prctl_check_order
 
 	error = -EINVAL;
-
-	/*
-	 * @brk should be after @end_data in traditional maps.
-	 */
-	if (prctl_map->start_brk <= prctl_map->end_data ||
-	    prctl_map->brk <= prctl_map->end_data)
-		goto out;
 
 	/*
 	 * Neither we should allow to override limits if they set.

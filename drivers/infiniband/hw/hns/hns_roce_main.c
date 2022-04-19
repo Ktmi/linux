@@ -269,6 +269,9 @@ static enum rdma_link_layer hns_roce_get_link_layer(struct ib_device *device,
 static int hns_roce_query_pkey(struct ib_device *ib_dev, u32 port, u16 index,
 			       u16 *pkey)
 {
+	if (index > 0)
+		return -EINVAL;
+
 	*pkey = PKEY_ID;
 
 	return 0;
@@ -348,7 +351,7 @@ static int hns_roce_mmap(struct ib_ucontext *context,
 		return rdma_user_mmap_io(context, vma,
 					 to_hr_ucontext(context)->uar.pfn,
 					 PAGE_SIZE,
-					 pgprot_noncached(vma->vm_page_prot),
+					 pgprot_device(vma->vm_page_prot),
 					 NULL);
 
 	/* vm_pgoff: 1 -- TPTR */
@@ -897,11 +900,9 @@ int hns_roce_init(struct hns_roce_dev *hr_dev)
 
 	if (hr_dev->cmd_mod) {
 		ret = hns_roce_cmd_use_events(hr_dev);
-		if (ret) {
+		if (ret)
 			dev_warn(dev,
 				 "Cmd event  mode failed, set back to poll!\n");
-			hns_roce_cmd_use_polling(hr_dev);
-		}
 	}
 
 	ret = hns_roce_init_hem(hr_dev);

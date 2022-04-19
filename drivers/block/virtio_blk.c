@@ -757,7 +757,7 @@ static int virtblk_probe(struct virtio_device *vdev)
 	}
 
 	/* Default queue sizing is to fill the ring. */
-	if (likely(!virtblk_queue_depth)) {
+	if (!virtblk_queue_depth) {
 		queue_depth = vblk->vqs[0].vq->num_free;
 		/* ... but without indirect descs, we use 2 descs per req */
 		if (!virtio_has_feature(vdev, VIRTIO_RING_F_INDIRECT_DESC))
@@ -948,6 +948,8 @@ static int virtblk_freeze(struct virtio_device *vdev)
 	blk_mq_quiesce_queue(vblk->disk->queue);
 
 	vdev->config->del_vqs(vdev);
+	kfree(vblk->vqs);
+
 	return 0;
 }
 

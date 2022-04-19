@@ -181,10 +181,6 @@
 			cap-sd-highspeed;
 			cap-mmc-highspeed;
 			/* All direction control is used */
-			st,sig-dir-cmd;
-			st,sig-dir-dat0;
-			st,sig-dir-dat2;
-			st,sig-dir-dat31;
 			st,sig-pin-fbclk;
 			full-pwr-cycle;
 			vmmc-supply = <&ab8500_ldo_aux3_reg>;
@@ -211,7 +207,7 @@
 			#size-cells = <0>;
 
 			wifi@1 {
-				compatible = "brcm,bcm4329-fmac";
+				compatible = "brcm,bcm4334-fmac", "brcm,bcm4329-fmac";
 				reg = <1>;
 				/* GPIO216 WL_HOST_WAKE */
 				interrupt-parent = <&gpio6>;
@@ -247,6 +243,7 @@
 
 			/* FIXME: not quite working yet, probably needs regulators */
 			bluetooth {
+				/* BCM4334B0 actually */
 				compatible = "brcm,bcm4330-bt";
 				shutdown-gpios = <&gpio6 30 GPIO_ACTIVE_HIGH>;
 				device-wakeup-gpios = <&gpio6 7 GPIO_ACTIVE_HIGH>;
@@ -289,10 +286,10 @@
 					};
 
 					ab8500_ldo_aux2 {
-						/* Supplies the Cypress TMA140 touchscreen only with 3.3V */
+						/* Supplies the Cypress TMA140 touchscreen only with 3.0V */
 						regulator-name = "AUX2";
-						regulator-min-microvolt = <3300000>;
-						regulator-max-microvolt = <3300000>;
+						regulator-min-microvolt = <3000000>;
+						regulator-max-microvolt = <3000000>;
 					};
 
 					ab8500_ldo_aux3 {
@@ -311,9 +308,9 @@
 
 					ab8500_ldo_aux5 {
 						regulator-name = "AUX5";
+						/* Intended for 1V8 for touchscreen but actually left unused */
 						regulator-min-microvolt = <1050000>;
 						regulator-max-microvolt = <2790000>;
-						regulator-always-on;
 					};
 
 					ab8500_ldo_aux6 {

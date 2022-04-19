@@ -418,62 +418,64 @@ static bool tcp_can_send_ack(const struct sock *ssk)
 	       (TCPF_SYN_SENT | TCPF_SYN_RECV | TCPF_TIME_WAIT | TCPF_CLOSE | TCPF_LISTEN));
 }
 
+void mptcp_subflow_send_ack(struct sock *ssk)
+{
+	bool slow;
+
+	slow = lock_sock_fast(ssk);
+	if (tcp_can_send_ack(ssk))
+		tcp_send_ack(ssk);
+	unlock_sock_fast(ssk, slow);
+}
+
 static void mptcp_send_ack(struct mptcp_sock *msk)
 {
 	struct mptcp_subflow_context *subflow;
 
-	mptcp_for_each_subflow(msk, subflow) {
-		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
-
-		lock_sock(ssk);
-		if (tcp_can_send_ack(ssk))
-			tcp_send_ack(ssk);
-		release_sock(ssk);
-	}
+	mptcp_for_each_subflow(msk, subflow)
+		mptcp_subflow_send_ack(mptcp_subflow_tcp_sock(subflow));
 }
 
-static bool mptcp_subflow_cleanup_rbuf(struct sock *ssk)
+static void mptcp_subflow_cleanup_rbuf(struct sock *ssk)
 {
-	int ret;
+	bool slow;
 
-	lock_sock(ssk);
-	ret = tcp_can_send_ack(ssk);
-	if (ret)
+	slow = lock_sock_fast(ssk);
+	if (tcp_can_send_ack(ssk))
 		tcp_cleanup_rbuf(ssk, 1);
-	release_sock(ssk);
-	return ret;
+	unlock_sock_fast(ssk, slow);
+}
+
+static bool mptcp_subflow_could_cleanup(const struct sock *ssk, bool rx_empty)
+{
+	const struct inet_connection_sock *icsk = inet_csk(ssk);
+	u8 ack_pending = READ_ONCE(icsk->icsk_ack.pending);
+	const struct tcp_sock *tp = tcp_sk(ssk);
+
+	return (ack_pending & ICSK_ACK_SCHED) &&
+		((READ_ONCE(tp->rcv_nxt) - READ_ONCE(tp->rcv_wup) >
+		  READ_ONCE(icsk->icsk_ack.rcv_mss)) ||
+		 (rx_empty && ack_pending &
+			      (ICSK_ACK_PUSHED2 | ICSK_ACK_PUSHED)));
 }
 
 static void mptcp_cleanup_rbuf(struct mptcp_sock *msk)
 {
-	struct sock *ack_hint = READ_ONCE(msk->ack_hint);
 	int old_space = READ_ONCE(msk->old_wspace);
 	struct mptcp_subflow_context *subflow;
 	struct sock *sk = (struct sock *)msk;
-	bool cleanup;
+	int space =  __mptcp_space(sk);
+	bool cleanup, rx_empty;
 
-	/* this is a simple superset of what tcp_cleanup_rbuf() implements
-	 * so that we don't have to acquire the ssk socket lock most of the time
-	 * to do actually nothing
-	 */
-	cleanup = __mptcp_space(sk) - old_space >= max(0, old_space);
-	if (!cleanup)
-		return;
+	cleanup = (space > 0) && (space >= (old_space << 1));
+	rx_empty = !__mptcp_rmem(sk);
 
-	/* if the hinted ssk is still active, try to use it */
-	if (likely(ack_hint)) {
-		mptcp_for_each_subflow(msk, subflow) {
-			struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
+	mptcp_for_each_subflow(msk, subflow) {
+		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
 
-			if (ack_hint == ssk && mptcp_subflow_cleanup_rbuf(ssk))
-				return;
-		}
+		if (cleanup || mptcp_subflow_could_cleanup(ssk, rx_empty))
+			mptcp_subflow_cleanup_rbuf(ssk);
 	}
-
-	/* otherwise pick the first active subflow */
-	mptcp_for_each_subflow(msk, subflow)
-		if (mptcp_subflow_cleanup_rbuf(mptcp_subflow_tcp_sock(subflow)))
-			return;
 }
 
 static bool mptcp_check_data_fin(struct sock *sk)
@@ -618,7 +620,6 @@ static bool __mptcp_move_skbs_from_subflow(struct mptcp_sock *msk,
 			break;
 		}
 	} while (more_data_avail);
-	WRITE_ONCE(msk->ack_hint, ssk);
 
 	*bytes += moved;
 	return done;
@@ -716,8 +717,10 @@ void mptcp_data_ready(struct sock *sk, struct sock *ssk)
 		sk_rbuf = ssk_rbuf;
 
 	/* over limit? can't append more skbs to msk, Also, no need to wake-up*/
-	if (atomic_read(&sk->sk_rmem_alloc) > sk_rbuf)
+	if (__mptcp_rmem(sk) > sk_rbuf) {
+		MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_RCVPRUNED);
 		return;
+	}
 
 	/* Wake-up the reader only for in-sequence data */
 	mptcp_data_lock(sk);
@@ -1501,7 +1504,7 @@ static void __mptcp_push_pending(struct sock *sk, unsigned int flags)
 			int ret = 0;
 
 			prev_ssk = ssk;
-			mptcp_flush_join_list(msk);
+			__mptcp_flush_join_list(msk);
 			ssk = mptcp_subflow_get_send(msk);
 
 			/* try to keep the subflow socket lock across
@@ -1579,7 +1582,8 @@ static void __mptcp_subflow_push_pending(struct sock *sk, struct sock *ssk)
 			if (!xmit_ssk)
 				goto out;
 			if (xmit_ssk != ssk) {
-				mptcp_subflow_delegate(mptcp_subflow_ctx(xmit_ssk));
+				mptcp_subflow_delegate(mptcp_subflow_ctx(xmit_ssk),
+						       MPTCP_DELEGATE_SEND);
 				goto out;
 			}
 
@@ -1801,7 +1805,7 @@ static int __mptcp_recvmsg_mskq(struct mptcp_sock *msk,
 		if (!(flags & MSG_PEEK)) {
 			/* we will bulk release the skb memory later */
 			skb->destructor = NULL;
-			msk->rmem_released += skb->truesize;
+			WRITE_ONCE(msk->rmem_released, msk->rmem_released + skb->truesize);
 			__skb_unlink(skb, &msk->receive_queue);
 			__kfree_skb(skb);
 		}
@@ -1920,7 +1924,7 @@ static void __mptcp_update_rmem(struct sock *sk)
 
 	atomic_sub(msk->rmem_released, &sk->sk_rmem_alloc);
 	sk_mem_uncharge(sk, msk->rmem_released);
-	msk->rmem_released = 0;
+	WRITE_ONCE(msk->rmem_released, 0);
 }
 
 static void __mptcp_splice_receive_queue(struct sock *sk)
@@ -1953,7 +1957,6 @@ static bool __mptcp_move_skbs(struct mptcp_sock *msk)
 		__mptcp_update_rmem(sk);
 		done = __mptcp_move_skbs_from_subflow(msk, ssk, &moved);
 		mptcp_data_unlock(sk);
-		tcp_cleanup_rbuf(ssk, moved);
 
 		if (unlikely(ssk->sk_err))
 			__mptcp_error_report(sk);
@@ -1969,7 +1972,6 @@ static bool __mptcp_move_skbs(struct mptcp_sock *msk)
 		ret |= __mptcp_ofo_queue(msk);
 		__mptcp_splice_receive_queue(sk);
 		mptcp_data_unlock(sk);
-		mptcp_cleanup_rbuf(msk);
 	}
 	if (ret)
 		mptcp_check_data_fin((struct sock *)msk);
@@ -2214,9 +2216,6 @@ static void __mptcp_close_ssk(struct sock *sk, struct sock *ssk,
 	if (ssk == msk->last_snd)
 		msk->last_snd = NULL;
 
-	if (ssk == msk->ack_hint)
-		msk->ack_hint = NULL;
-
 	if (ssk == msk->first)
 		msk->first = NULL;
 
@@ -2288,13 +2287,14 @@ static void mptcp_check_fastclose(struct mptcp_sock *msk)
 
 	list_for_each_entry_safe(subflow, tmp, &msk->conn_list, node) {
 		struct sock *tcp_sk = mptcp_subflow_tcp_sock(subflow);
+		bool slow;
 
-		lock_sock(tcp_sk);
+		slow = lock_sock_fast(tcp_sk);
 		if (tcp_sk->sk_state != TCP_CLOSE) {
 			tcp_send_active_reset(tcp_sk, GFP_ATOMIC);
 			tcp_set_state(tcp_sk, TCP_CLOSE);
 		}
-		release_sock(tcp_sk);
+		unlock_sock_fast(tcp_sk, slow);
 	}
 
 	inet_sk_state_store(sk, TCP_CLOSE);
@@ -2426,11 +2426,10 @@ static int __mptcp_init_sock(struct sock *sk)
 	msk->out_of_order_queue = RB_ROOT;
 	msk->first_pending = NULL;
 	msk->wmem_reserved = 0;
-	msk->rmem_released = 0;
+	WRITE_ONCE(msk->rmem_released, 0);
 	msk->tx_pending_data = 0;
 	msk->size_goal_cache = TCP_BASE_MSS;
 
-	msk->ack_hint = NULL;
 	msk->first = NULL;
 	inet_csk(sk)->icsk_sync_mss = mptcp_sync_mss;
 
@@ -2850,7 +2849,7 @@ static struct sock *mptcp_accept(struct sock *sk, int flags, int *err,
 		 */
 		if (WARN_ON_ONCE(!new_mptcp_sock)) {
 			tcp_sk(newsk)->is_mptcp = 0;
-			return newsk;
+			goto out;
 		}
 
 		/* acquire the 2nd reference for the owning socket */
@@ -2862,6 +2861,8 @@ static struct sock *mptcp_accept(struct sock *sk, int flags, int *err,
 				MPTCP_MIB_MPCAPABLEPASSIVEFALLBACK);
 	}
 
+out:
+	newsk->sk_kern_sock = kern;
 	return newsk;
 }
 
@@ -2909,7 +2910,7 @@ void __mptcp_check_push(struct sock *sk, struct sock *ssk)
 		if (xmit_ssk == ssk)
 			__mptcp_subflow_push_pending(sk, ssk);
 		else if (xmit_ssk)
-			mptcp_subflow_delegate(mptcp_subflow_ctx(xmit_ssk));
+			mptcp_subflow_delegate(mptcp_subflow_ctx(xmit_ssk), MPTCP_DELEGATE_SEND);
 	} else {
 		set_bit(MPTCP_PUSH_PENDING, &mptcp_sk(sk)->flags);
 	}
@@ -2946,6 +2947,11 @@ static void mptcp_release_cb(struct sock *sk)
 		spin_lock_bh(&sk->sk_lock.slock);
 	}
 
+	/* be sure to set the current sk state before tacking actions
+	 * depending on sk_state
+	 */
+	if (test_and_clear_bit(MPTCP_CONNECTED, &mptcp_sk(sk)->flags))
+		__mptcp_set_connected(sk);
 	if (test_and_clear_bit(MPTCP_CLEAN_UNA, &mptcp_sk(sk)->flags))
 		__mptcp_clean_una_wakeup(sk);
 	if (test_and_clear_bit(MPTCP_ERROR_REPORT, &mptcp_sk(sk)->flags))
@@ -2958,18 +2964,50 @@ static void mptcp_release_cb(struct sock *sk)
 	__mptcp_update_rmem(sk);
 }
 
+/* MP_JOIN client subflow must wait for 4th ack before sending any data:
+ * TCP can't schedule delack timer before the subflow is fully established.
+ * MPTCP uses the delack timer to do 3rd ack retransmissions
+ */
+static void schedule_3rdack_retransmission(struct sock *ssk)
+{
+	struct inet_connection_sock *icsk = inet_csk(ssk);
+	struct tcp_sock *tp = tcp_sk(ssk);
+	unsigned long timeout;
+
+	if (mptcp_subflow_ctx(ssk)->fully_established)
+		return;
+
+	/* reschedule with a timeout above RTT, as we must look only for drop */
+	if (tp->srtt_us)
+		timeout = usecs_to_jiffies(tp->srtt_us >> (3 - 1));
+	else
+		timeout = TCP_TIMEOUT_INIT;
+	timeout += jiffies;
+
+	WARN_ON_ONCE(icsk->icsk_ack.pending & ICSK_ACK_TIMER);
+	icsk->icsk_ack.pending |= ICSK_ACK_SCHED | ICSK_ACK_TIMER;
+	icsk->icsk_ack.timeout = timeout;
+	sk_reset_timer(ssk, &icsk->icsk_delack_timer, timeout);
+}
+
 void mptcp_subflow_process_delegated(struct sock *ssk)
 {
 	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(ssk);
 	struct sock *sk = subflow->conn;
 
-	mptcp_data_lock(sk);
-	if (!sock_owned_by_user(sk))
-		__mptcp_subflow_push_pending(sk, ssk);
-	else
-		set_bit(MPTCP_PUSH_PENDING, &mptcp_sk(sk)->flags);
-	mptcp_data_unlock(sk);
-	mptcp_subflow_delegated_done(subflow);
+	if (test_bit(MPTCP_DELEGATE_SEND, &subflow->delegated_status)) {
+		mptcp_data_lock(sk);
+		if (!sock_owned_by_user(sk))
+			__mptcp_subflow_push_pending(sk, ssk);
+		else
+			set_bit(MPTCP_PUSH_PENDING, &mptcp_sk(sk)->flags);
+		mptcp_data_unlock(sk);
+		mptcp_subflow_delegated_done(subflow, MPTCP_DELEGATE_SEND);
+	}
+	if (test_bit(MPTCP_DELEGATE_ACK, &subflow->delegated_status)) {
+		schedule_3rdack_retransmission(ssk);
+		mptcp_subflow_delegated_done(subflow, MPTCP_DELEGATE_ACK);
+	}
 }
 
 static int mptcp_hash(struct sock *sk)

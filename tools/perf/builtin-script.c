@@ -465,7 +465,7 @@ static int evsel__check_attr(struct evsel *evsel, struct perf_session *session)
 		return -EINVAL;
 
 	if (PRINT_FIELD(WEIGHT) &&
-	    evsel__check_stype(evsel, PERF_SAMPLE_WEIGHT, "WEIGHT", PERF_OUTPUT_WEIGHT))
+	    evsel__check_stype(evsel, PERF_SAMPLE_WEIGHT_TYPE, "WEIGHT", PERF_OUTPUT_WEIGHT))
 		return -EINVAL;
 
 	if (PRINT_FIELD(SYM) &&
@@ -2405,7 +2405,7 @@ static int process_switch_event(struct perf_tool *tool,
 	if (perf_event__process_switch(tool, event, sample, machine) < 0)
 		return -1;
 
-	if (scripting_ops && scripting_ops->process_switch)
+	if (scripting_ops && scripting_ops->process_switch && !filter_cpu(sample))
 		scripting_ops->process_switch(event, sample, machine);
 
 	if (!script->show_switch_events)
@@ -2532,6 +2532,12 @@ static void perf_script__exit_per_event_dump_stats(struct perf_script *script)
 		evsel_script__delete(es);
 		evsel->priv = NULL;
 	}
+}
+
+static void perf_script__exit(struct perf_script *script)
+{
+	perf_thread_map__put(script->threads);
+	perf_cpu_map__put(script->cpus);
 }
 
 static int __cmd_script(struct perf_script *script)
@@ -3870,11 +3876,15 @@ int cmd_script(int argc, const char **argv)
 		goto out_delete;
 
 	uname(&uts);
-	if (data.is_pipe ||  /* assume pipe_mode indicates native_arch */
-	    !strcmp(uts.machine, session->header.env.arch) ||
-	    (!strcmp(uts.machine, "x86_64") &&
-	     !strcmp(session->header.env.arch, "i386")))
+	if (data.is_pipe) { /* Assume pipe_mode indicates native_arch */
 		native_arch = true;
+	} else if (session->header.env.arch) {
+		if (!strcmp(uts.machine, session->header.env.arch))
+			native_arch = true;
+		else if (!strcmp(uts.machine, "x86_64") &&
+			 !strcmp(session->header.env.arch, "i386"))
+			native_arch = true;
+	}
 
 	script.session = session;
 	script__setup_sample_type(&script);
@@ -3991,8 +4001,10 @@ out_delete:
 		zfree(&script.ptime_range);
 	}
 
+	zstd_fini(&(session->zstd_data));
 	evlist__free_stats(session->evlist);
 	perf_session__delete(session);
+	perf_script__exit(&script);
 
 	if (script_started)
 		cleanup_scripting();

@@ -294,6 +294,14 @@ struct idxd_desc {
 	struct idxd_wq *wq;
 };
 
+/*
+ * This is software defined error for the completion status. We overload the error code
+ * that will never appear in completion status and only SWERR register.
+ */
+enum idxd_completion_status {
+	IDXD_COMP_DESC_ABORT = 0xff,
+};
+
 #define confdev_to_idxd(dev) container_of(dev, struct idxd_device, conf_dev)
 #define confdev_to_wq(dev) container_of(dev, struct idxd_wq, conf_dev)
 
@@ -420,9 +428,8 @@ int idxd_device_init_reset(struct idxd_device *idxd);
 int idxd_device_enable(struct idxd_device *idxd);
 int idxd_device_disable(struct idxd_device *idxd);
 void idxd_device_reset(struct idxd_device *idxd);
-void idxd_device_cleanup(struct idxd_device *idxd);
+void idxd_device_clear_state(struct idxd_device *idxd);
 int idxd_device_config(struct idxd_device *idxd);
-void idxd_device_wqs_clear_state(struct idxd_device *idxd);
 void idxd_device_drain_pasid(struct idxd_device *idxd, int pasid);
 int idxd_device_load_config(struct idxd_device *idxd);
 int idxd_device_request_int_handle(struct idxd_device *idxd, int idx, int *handle,
@@ -435,12 +442,11 @@ void idxd_wqs_unmap_portal(struct idxd_device *idxd);
 int idxd_wq_alloc_resources(struct idxd_wq *wq);
 void idxd_wq_free_resources(struct idxd_wq *wq);
 int idxd_wq_enable(struct idxd_wq *wq);
-int idxd_wq_disable(struct idxd_wq *wq);
+int idxd_wq_disable(struct idxd_wq *wq, bool reset_config);
 void idxd_wq_drain(struct idxd_wq *wq);
 void idxd_wq_reset(struct idxd_wq *wq);
 int idxd_wq_map_portal(struct idxd_wq *wq);
 void idxd_wq_unmap_portal(struct idxd_wq *wq);
-void idxd_wq_disable_cleanup(struct idxd_wq *wq);
 int idxd_wq_set_pasid(struct idxd_wq *wq, int pasid);
 int idxd_wq_disable_pasid(struct idxd_wq *wq);
 void idxd_wq_quiesce(struct idxd_wq *wq);
@@ -481,5 +487,11 @@ static inline void perfmon_counter_overflow(struct idxd_device *idxd) {}
 static inline void perfmon_init(void) {}
 static inline void perfmon_exit(void) {}
 #endif
+
+static inline void complete_desc(struct idxd_desc *desc, enum idxd_complete_type reason)
+{
+	idxd_dma_complete_txd(desc, reason);
+	idxd_free_desc(desc->wq, desc);
+}
 
 #endif

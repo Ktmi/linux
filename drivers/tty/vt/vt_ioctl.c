@@ -246,6 +246,8 @@ int vt_waitactive(int n)
  *
  * XXX It should at least call into the driver, fbdev's definitely need to
  * restore their engine state. --BenH
+ *
+ * Called with the console lock held.
  */
 static int vt_kdsetmode(struct vc_data *vc, unsigned long mode)
 {
@@ -262,7 +264,6 @@ static int vt_kdsetmode(struct vc_data *vc, unsigned long mode)
 		return -EINVAL;
 	}
 
-	/* FIXME: this needs the console lock extending */
 	if (vc->vc_mode == mode)
 		return 0;
 
@@ -271,12 +272,10 @@ static int vt_kdsetmode(struct vc_data *vc, unsigned long mode)
 		return 0;
 
 	/* explicitly blank/unblank the screen if switching modes */
-	console_lock();
 	if (mode == KD_TEXT)
 		do_unblank_screen(1);
 	else
 		do_blank_screen(1);
-	console_unlock();
 
 	return 0;
 }
@@ -378,7 +377,10 @@ static int vt_k_ioctl(struct tty_struct *tty, unsigned int cmd,
 		if (!perm)
 			return -EPERM;
 
-		return vt_kdsetmode(vc, arg);
+		console_lock();
+		ret = vt_kdsetmode(vc, arg);
+		console_unlock();
+		return ret;
 
 	case KDGETMODE:
 		return put_user(vc->vc_mode, (int __user *)arg);
@@ -597,8 +599,8 @@ static int vt_setactivate(struct vt_setactivate __user *sa)
 	if (vsa.console == 0 || vsa.console > MAX_NR_CONSOLES)
 		return -ENXIO;
 
-	vsa.console = array_index_nospec(vsa.console, MAX_NR_CONSOLES + 1);
 	vsa.console--;
+	vsa.console = array_index_nospec(vsa.console, MAX_NR_CONSOLES);
 	console_lock();
 	ret = vc_allocate(vsa.console);
 	if (ret) {
@@ -843,6 +845,7 @@ int vt_ioctl(struct tty_struct *tty,
 			return -ENXIO;
 
 		arg--;
+		arg = array_index_nospec(arg, MAX_NR_CONSOLES);
 		console_lock();
 		ret = vc_allocate(arg);
 		console_unlock();
@@ -955,9 +958,9 @@ int vt_ioctl(struct tty_struct *tty,
 	return 0;
 }
 
-void reset_vc(struct vc_data *vc)
+void reset_vc(struct vc_data *vc, int mode)
 {
-	vc->vc_mode = KD_TEXT;
+	vc->vc_mode = mode;
 	vt_reset_unicode(vc->vc_num);
 	vc->vt_mode.mode = VT_AUTO;
 	vc->vt_mode.waitv = 0;
@@ -988,7 +991,7 @@ void vc_SAK(struct work_struct *work)
 		 */
 		if (tty)
 			__do_SAK(tty);
-		reset_vc(vc);
+		reset_vc(vc, KD_TEXT);
 	}
 	console_unlock();
 }
@@ -1174,7 +1177,7 @@ static void complete_change_console(struct vc_data *vc)
 		 * this outside of VT_PROCESS but there is no single process
 		 * to account for and tracking tty count may be undesirable.
 		 */
-			reset_vc(vc);
+			reset_vc(vc, KD_TEXT);
 
 			if (old_vc_mode != vc->vc_mode) {
 				if (vc->vc_mode == KD_TEXT)
@@ -1246,7 +1249,7 @@ void change_console(struct vc_data *new_vc)
 		 * this outside of VT_PROCESS but there is no single process
 		 * to account for and tracking tty count may be undesirable.
 		 */
-		reset_vc(vc);
+		reset_vc(vc, KD_TEXT);
 
 		/*
 		 * Fall through to normal (VT_AUTO) handling of the switch...

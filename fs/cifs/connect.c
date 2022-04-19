@@ -90,6 +90,8 @@ static int reconn_set_ipaddr_from_hostname(struct TCP_Server_Info *server)
 	int rc;
 	int len;
 	char *unc, *ipaddr = NULL;
+	time64_t expiry, now;
+	unsigned long ttl = SMB_DNS_RESOLVE_INTERVAL_DEFAULT;
 
 	if (!server->hostname)
 		return -EINVAL;
@@ -103,13 +105,13 @@ static int reconn_set_ipaddr_from_hostname(struct TCP_Server_Info *server)
 	}
 	scnprintf(unc, len, "\\\\%s", server->hostname);
 
-	rc = dns_resolve_server_name_to_ip(unc, &ipaddr);
+	rc = dns_resolve_server_name_to_ip(unc, &ipaddr, &expiry);
 	kfree(unc);
 
 	if (rc < 0) {
 		cifs_dbg(FYI, "%s: failed to resolve server part of %s to IP: %d\n",
 			 __func__, server->hostname, rc);
-		return rc;
+		goto requeue_resolve;
 	}
 
 	spin_lock(&cifs_tcp_ses_lock);
@@ -118,7 +120,45 @@ static int reconn_set_ipaddr_from_hostname(struct TCP_Server_Info *server)
 	spin_unlock(&cifs_tcp_ses_lock);
 	kfree(ipaddr);
 
-	return !rc ? -1 : 0;
+	/* rc == 1 means success here */
+	if (rc) {
+		now = ktime_get_real_seconds();
+		if (expiry && expiry > now)
+			/*
+			 * To make sure we don't use the cached entry, retry 1s
+			 * after expiry.
+			 */
+			ttl = max_t(unsigned long, expiry - now, SMB_DNS_RESOLVE_INTERVAL_MIN) + 1;
+	}
+	rc = !rc ? -1 : 0;
+
+requeue_resolve:
+	cifs_dbg(FYI, "%s: next dns resolution scheduled for %lu seconds in the future\n",
+		 __func__, ttl);
+	mod_delayed_work(cifsiod_wq, &server->resolve, (ttl * HZ));
+
+	return rc;
+}
+
+
+static void cifs_resolve_server(struct work_struct *work)
+{
+	int rc;
+	struct TCP_Server_Info *server = container_of(work,
+					struct TCP_Server_Info, resolve.work);
+
+	mutex_lock(&server->srv_mutex);
+
+	/*
+	 * Resolve the hostname again to make sure that IP address is up-to-date.
+	 */
+	rc = reconn_set_ipaddr_from_hostname(server);
+	if (rc) {
+		cifs_dbg(FYI, "%s: failed to resolve hostname: %d\n",
+				__func__, rc);
+	}
+
+	mutex_unlock(&server->srv_mutex);
 }
 
 #ifdef CONFIG_CIFS_DFS_UPCALL
@@ -698,6 +738,7 @@ static void clean_demultiplex_info(struct TCP_Server_Info *server)
 	spin_unlock(&cifs_tcp_ses_lock);
 
 	cancel_delayed_work_sync(&server->echo);
+	cancel_delayed_work_sync(&server->resolve);
 
 	spin_lock(&GlobalMid_Lock);
 	server->tcpStatus = CifsExiting;
@@ -772,7 +813,6 @@ static void clean_demultiplex_info(struct TCP_Server_Info *server)
 		 */
 	}
 
-	kfree(server->hostname);
 	kfree(server);
 
 	length = atomic_dec_return(&tcpSesAllocCount);
@@ -1199,6 +1239,10 @@ static int match_server(struct TCP_Server_Info *server, struct smb3_fs_context *
 	if (ctx->nosharesock)
 		return 0;
 
+	/* this server does not share socket */
+	if (server->nosharesock)
+		return 0;
+
 	/* If multidialect negotiation see if existing sessions match one */
 	if (strcmp(ctx->vals->version_string, SMB3ANY_VERSION_STRING) == 0) {
 		if (server->vals->protocol_id < SMB30_PROT_ID)
@@ -1211,6 +1255,9 @@ static int match_server(struct TCP_Server_Info *server, struct smb3_fs_context *
 		return 0;
 
 	if (!net_eq(cifs_net_ns(server), current->nsproxy->net_ns))
+		return 0;
+
+	if (strcasecmp(server->hostname, ctx->server_hostname))
 		return 0;
 
 	if (!match_address(server, addr,
@@ -1278,6 +1325,7 @@ cifs_put_tcp_session(struct TCP_Server_Info *server, int from_reconnect)
 	spin_unlock(&cifs_tcp_ses_lock);
 
 	cancel_delayed_work_sync(&server->echo);
+	cancel_delayed_work_sync(&server->resolve);
 
 	if (from_reconnect)
 		/*
@@ -1300,6 +1348,7 @@ cifs_put_tcp_session(struct TCP_Server_Info *server, int from_reconnect)
 	kfree(server->session_key.response);
 	server->session_key.response = NULL;
 	server->session_key.len = 0;
+	kfree(server->hostname);
 
 	task = xchg(&server->tsk, NULL);
 	if (task)
@@ -1325,14 +1374,18 @@ cifs_get_tcp_session(struct smb3_fs_context *ctx)
 		goto out_err;
 	}
 
+	tcp_ses->hostname = kstrdup(ctx->server_hostname, GFP_KERNEL);
+	if (!tcp_ses->hostname) {
+		rc = -ENOMEM;
+		goto out_err;
+	}
+
+	if (ctx->nosharesock)
+		tcp_ses->nosharesock = true;
+
 	tcp_ses->ops = ctx->ops;
 	tcp_ses->vals = ctx->vals;
 	cifs_set_net_ns(tcp_ses, get_net(current->nsproxy->net_ns));
-	tcp_ses->hostname = extract_hostname(ctx->UNC);
-	if (IS_ERR(tcp_ses->hostname)) {
-		rc = PTR_ERR(tcp_ses->hostname);
-		goto out_err_crypto_release;
-	}
 
 	tcp_ses->conn_id = atomic_inc_return(&tcpSesNextId);
 	tcp_ses->noblockcnt = ctx->rootfs;
@@ -1360,6 +1413,7 @@ cifs_get_tcp_session(struct smb3_fs_context *ctx)
 	INIT_LIST_HEAD(&tcp_ses->tcp_ses_list);
 	INIT_LIST_HEAD(&tcp_ses->smb_ses_list);
 	INIT_DELAYED_WORK(&tcp_ses->echo, cifs_echo_request);
+	INIT_DELAYED_WORK(&tcp_ses->resolve, cifs_resolve_server);
 	INIT_DELAYED_WORK(&tcp_ses->reconnect, smb2_reconnect_server);
 	mutex_init(&tcp_ses->reconnect_mutex);
 	memcpy(&tcp_ses->srcaddr, &ctx->srcaddr,
@@ -1440,6 +1494,12 @@ smbd_connected:
 	/* queue echo request delayed work */
 	queue_delayed_work(cifsiod_wq, &tcp_ses->echo, tcp_ses->echo_interval);
 
+	/* queue dns resolution delayed work */
+	cifs_dbg(FYI, "%s: next dns resolution scheduled for %d seconds in the future\n",
+		 __func__, SMB_DNS_RESOLVE_INTERVAL_DEFAULT);
+
+	queue_delayed_work(cifsiod_wq, &tcp_ses->resolve, (SMB_DNS_RESOLVE_INTERVAL_DEFAULT * HZ));
+
 	return tcp_ses;
 
 out_err_crypto_release:
@@ -1449,8 +1509,7 @@ out_err_crypto_release:
 
 out_err:
 	if (tcp_ses) {
-		if (!IS_ERR(tcp_ses->hostname))
-			kfree(tcp_ses->hostname);
+		kfree(tcp_ses->hostname);
 		if (tcp_ses->ssocket)
 			sock_release(tcp_ses->ssocket);
 		kfree(tcp_ses);
@@ -1617,9 +1676,12 @@ void cifs_put_smb_ses(struct cifs_ses *ses)
 		spin_unlock(&cifs_tcp_ses_lock);
 		return;
 	}
+	spin_unlock(&cifs_tcp_ses_lock);
+
+	spin_lock(&GlobalMid_Lock);
 	if (ses->status == CifsGood)
 		ses->status = CifsExiting;
-	spin_unlock(&cifs_tcp_ses_lock);
+	spin_unlock(&GlobalMid_Lock);
 
 	cifs_free_ipc(ses);
 
@@ -2328,9 +2390,10 @@ cifs_match_super(struct super_block *sb, void *data)
 	spin_lock(&cifs_tcp_ses_lock);
 	cifs_sb = CIFS_SB(sb);
 	tlink = cifs_get_tlink(cifs_sb_master_tlink(cifs_sb));
-	if (IS_ERR(tlink)) {
+	if (tlink == NULL) {
+		/* can not match superblock if tlink were ever null */
 		spin_unlock(&cifs_tcp_ses_lock);
-		return rc;
+		return 0;
 	}
 	tcon = tlink_tcon(tlink);
 	ses = tcon->ses;
@@ -4103,7 +4166,8 @@ int cifs_tree_connect(const unsigned int xid, struct cifs_tcon *tcon, const stru
 	if (!tree)
 		return -ENOMEM;
 
-	if (!tcon->dfs_path) {
+	/* If it is not dfs or there was no cached dfs referral, then reconnect to same share */
+	if (!tcon->dfs_path || dfs_cache_noreq_find(tcon->dfs_path + 1, &ref, &tl)) {
 		if (tcon->ipc) {
 			scnprintf(tree, MAX_TREE_SIZE, "\\\\%s\\IPC$", server->hostname);
 			rc = ops->tree_connect(xid, tcon->ses, tree, tcon, nlsc);
@@ -4113,9 +4177,6 @@ int cifs_tree_connect(const unsigned int xid, struct cifs_tcon *tcon, const stru
 		goto out;
 	}
 
-	rc = dfs_cache_noreq_find(tcon->dfs_path + 1, &ref, &tl);
-	if (rc)
-		goto out;
 	isroot = ref.server_type == DFS_TYPE_ROOT;
 	free_dfs_info_param(&ref);
 

@@ -2051,6 +2051,9 @@ static void nix_free_tx_vtag_entries(struct rvu *rvu, u16 pcifunc)
 		return;
 
 	nix_hw = get_nix_hw(rvu->hw, blkaddr);
+	if (!nix_hw)
+		return;
+
 	vlan = &nix_hw->txvlan;
 
 	mutex_lock(&vlan->rsrc_lock);
@@ -3587,7 +3590,6 @@ static void rvu_nix_block_freemem(struct rvu *rvu, int blkaddr,
 		vlan = &nix_hw->txvlan;
 		kfree(vlan->rsrc.bmap);
 		mutex_destroy(&vlan->rsrc_lock);
-		devm_kfree(rvu->dev, vlan->entry2pfvf_map);
 
 		mcast = &nix_hw->mcast;
 		qmem_free(rvu->dev, mcast->mce_ctx);

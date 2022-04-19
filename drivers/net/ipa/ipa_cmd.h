@@ -57,20 +57,18 @@ struct ipa_cmd_info {
 	enum dma_data_direction direction;
 };
 
-#ifdef IPA_VALIDATE
-
 /**
  * ipa_cmd_table_valid() - Validate a memory region holding a table
  * @ipa:	- IPA pointer
  * @mem:	- IPA memory region descriptor
  * @route:	- Whether the region holds a route or filter table
- * @ipv6:	- Whether the table is for IPv6 or IPv4
- * @hashed:	- Whether the table is hashed or non-hashed
  *
  * Return:	true if region is valid, false otherwise
  */
 bool ipa_cmd_table_valid(struct ipa *ipa, const struct ipa_mem *mem,
-			    bool route, bool ipv6, bool hashed);
+			    bool route);
+
+#ifdef IPA_VALIDATE
 
 /**
  * ipa_cmd_data_valid() - Validate command-realted configuration is valid
@@ -81,13 +79,6 @@ bool ipa_cmd_table_valid(struct ipa *ipa, const struct ipa_mem *mem,
 bool ipa_cmd_data_valid(struct ipa *ipa);
 
 #else /* !IPA_VALIDATE */
-
-static inline bool ipa_cmd_table_valid(struct ipa *ipa,
-				       const struct ipa_mem *mem, bool route,
-				       bool ipv6, bool hashed)
-{
-	return true;
-}
 
 static inline bool ipa_cmd_data_valid(struct ipa *ipa)
 {
@@ -182,12 +173,6 @@ u32 ipa_cmd_pipeline_clear_count(void);
  * @ipa:	- IPA pointer
  */
 void ipa_cmd_pipeline_clear_wait(struct ipa *ipa);
-
-/**
- * ipa_cmd_pipeline_clear() - Clear the hardware pipeline
- * @ipa:	- IPA pointer
- */
-void ipa_cmd_pipeline_clear(struct ipa *ipa);
 
 /**
  * ipa_cmd_trans_alloc() - Allocate a transaction for the command TX endpoint

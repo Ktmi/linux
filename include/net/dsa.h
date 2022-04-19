@@ -514,8 +514,16 @@ struct dsa_switch_ops {
 	int	(*change_tag_protocol)(struct dsa_switch *ds, int port,
 				       enum dsa_tag_protocol proto);
 
+	/* Optional switch-wide initialization and destruction methods */
 	int	(*setup)(struct dsa_switch *ds);
 	void	(*teardown)(struct dsa_switch *ds);
+
+	/* Per-port initialization and destruction methods. Mandatory if the
+	 * driver registers devlink port regions, optional otherwise.
+	 */
+	int	(*port_setup)(struct dsa_switch *ds, int port);
+	void	(*port_teardown)(struct dsa_switch *ds, int port);
+
 	u32	(*get_phy_flags)(struct dsa_switch *ds, int port);
 
 	/*
@@ -643,8 +651,6 @@ struct dsa_switch_ops {
 	int	(*port_bridge_flags)(struct dsa_switch *ds, int port,
 				     struct switchdev_brport_flags flags,
 				     struct netlink_ext_ack *extack);
-	int	(*port_set_mrouter)(struct dsa_switch *ds, int port, bool mrouter,
-				    struct netlink_ext_ack *extack);
 
 	/*
 	 * VLAN support

@@ -135,6 +135,9 @@ static u32 io_convert_ctx_access(enum bpf_access_type type,
 				  struct bpf_prog *prog, u32 *target_size)
 {
 	struct bpf_insn *insn = insn_buf;
+	if (type == BPF_WRITE) {
+		return false;
+	}
 	switch (si->off) {
 	case offsetof(struct bpf_io_md, buf):
 		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct bpf_io_buff, buf),

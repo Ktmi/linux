@@ -3250,6 +3250,7 @@ static bool may_access_direct_pkt_data(struct bpf_verifier_env *env,
 		fallthrough;
 
 	/* Program types with direct read + write access go here! */
+	case BPF_PROG_TYPE_IO:
 	case BPF_PROG_TYPE_SCHED_CLS:
 	case BPF_PROG_TYPE_SCHED_ACT:
 	case BPF_PROG_TYPE_XDP:
